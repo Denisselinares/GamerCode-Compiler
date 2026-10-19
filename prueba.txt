@@ -1,0 +1,8 @@
+inicio
+  x = 5;
+  y = 10;
+  impsl("Hola mundo")
+  si (x < y) {
+    impsl("x es menor")
+  }
+fin

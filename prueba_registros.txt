@@ -1,0 +1,25 @@
+inicio
+
+# ============================================================
+# PRUEBA 1: ASIGNACION DE REGISTROS
+# Tres variables vivas al mismo tiempo dentro del ciclo.
+# El optimizador debe asignarles registros distintos porque
+# todas interfieren entre si (estan vivas simultaneamente).
+# Esperado: total->R0, n->R1, mitad->R2 (o cualquier combo
+# donde los tres reciban registros distintos sin spill)
+# ============================================================
+
+entero n     = 6;
+entero total = 0;
+entero mitad = 0;
+
+mientras (n > 0) {
+    total = total + n;
+    mitad = n // 2;
+    n = n - 1;
+}
+
+impsl(total);   # -> 21
+impsl(mitad);   # -> 0
+
+fin

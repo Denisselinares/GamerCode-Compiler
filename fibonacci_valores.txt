@@ -1,0 +1,32 @@
+inicio
+    entero a = 0;
+    entero b = 1;
+    entero c = 0;
+    entero i = 0;
+    entero encontrado = 0;
+    entero contador = 0;
+    entero inicio_val = 0;
+
+    imp("Ingresa un valor de la serie Fibonacci: ");
+    inicio_val = leer("Valor: ");
+
+    mientras (encontrado == 0) {
+        si (a == inicio_val) {
+            encontrado = 1;
+        }
+        si (encontrado == 0) {
+            c = a + b;
+            a = b;
+            b = c;
+            i = i + 1;
+        }
+    }
+
+    mientras (contador < 20) {
+        impsl(a);
+        c = a + b;
+        a = b;
+        b = c;
+        contador = contador + 1;
+    }
+fin

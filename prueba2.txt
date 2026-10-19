@@ -1,0 +1,14 @@
+inicio
+ entero a = 0;
+ entero b = 1;
+ entero c = 0;
+ entero i = 0;
+
+mientras ( i < 50 ){
+ impsl(a);
+ c = b + a;
+ a = b;
+ b = c;
+ i = i + 1;
+}
+fin

@@ -1,0 +1,29 @@
+inicio
+    entero a = 0;
+    entero b = 1;
+    entero c = 0;
+    entero i = 0;
+    entero opcion = 0;
+
+    impsl("1 - Fibonacci pares");
+    impsl("2 - Fibonacci impares");
+    imp("Elige una opcion: ");
+    opcion = leer("Opcion: ");
+
+    mientras (i < 50) {
+        si (opcion == 1) {
+            si (a % 2 == 0) {
+                impsl(a);
+            }
+        }
+        si (opcion == 2) {
+            si (a % 2 != 0) {
+                impsl(a);
+            }
+        }
+        c = a + b;
+        a = b;
+        b = c;
+        i = i + 1;
+    }
+fin

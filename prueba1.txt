@@ -1,0 +1,11 @@
+inicio
+    decimal n1 = 8.5;
+
+    decimal n2 = 9.0;
+    decimal resultado = 0.0;
+    entero n3 = 10.3 ; 
+    resultado = (n1 + n2) / 2.0;
+    
+    imp("El promedio es: ");
+    impsl(resultado);
+fin

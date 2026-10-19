@@ -1,0 +1,8 @@
+inicio
+    nota1 = 80;
+    nota2 = 100;
+    resultado = (nota1 + nota2) / 2;
+    
+    impsl("El promedio es: ");
+    impsl(resultado);
+fin

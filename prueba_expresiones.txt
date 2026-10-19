@@ -1,0 +1,28 @@
+inicio
+
+# ============================================================
+# PRUEBA 2: SIMPLIFICACION DE EXPRESIONES
+# El optimizador debe aplicar:
+#   - Plegado de constantes : 3 + 4 -> 7
+#   - Algebra               : x * 1 -> x  /  y + 0 -> y
+#   - CSE                   : a + b calculado dos veces ->
+#                             segunda vez reutiliza el temporal
+# ============================================================
+
+entero a = 3 + 4;       # plegado: a = 7  (no debe generar _t = 3+4)
+entero b = 10 * 2;      # plegado: b = 20
+
+entero x = a * 1;       # algebra: x = a  (elimina la multiplicacion)
+entero y = b + 0;       # algebra: y = b  (elimina la suma)
+
+entero p = a + b;       # CSE: _t1 = a + b
+entero q = a + b;       # CSE: q = _t1  (NO recalcula a + b)
+
+impsl(a);   # -> 7
+impsl(b);   # -> 20
+impsl(x);   # -> 7
+impsl(y);   # -> 20
+impsl(p);   # -> 27
+impsl(q);   # -> 27
+
+fin

@@ -1,0 +1,3362 @@
+options {
+  LOOKAHEAD = 3;
+}
+
+PARSER_BEGIN(CompiladorGamerCode)
+import java.util.ArrayList;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.util.Stack;
+import java.util.Map;
+import java.util.HashMap;
+
+// Clase para representar información de símbolos
+class Simbolo {
+    String tipo;
+    String categoria; // "variable", "constante", "funcion", "arreglo", "parametro"
+    boolean esConstante;
+    int scope; // 0 = global, 1+ = niveles de anidamiento
+    // Solo para funciones: lista ordenada de tipos de parámetros declarados
+    ArrayList<String> tiposParametros;
+    
+    public Simbolo(String tipo, String categoria, boolean esConstante, int scope) {
+        this.tipo = tipo;
+        this.categoria = categoria;
+        this.esConstante = esConstante;
+        this.scope = scope;
+        this.tiposParametros = new ArrayList<String>();
+    }
+}
+
+// Clase para representar cuadruplas de código intermedio
+class Cuadrupla {
+    String operador;
+    String operando1;
+    String operando2;
+    String resultado;
+    int linea;
+    
+    public Cuadrupla(String operador, String operando1, String operando2, String resultado, int linea) {
+        this.operador = operador;
+        this.operando1 = operando1;
+        this.operando2 = operando2;
+        this.resultado = resultado;
+        this.linea = linea;
+    }
+    
+    @Override
+    public String toString() {
+        return String.format("(%04d) %-8s, %-15s, %-15s, %-15s", 
+                linea, operador, operando1, operando2, resultado);
+    }
+}
+
+// Clase para manejar la generación de código intermedio
+class GeneradorCodigoIntermedio {
+    static ArrayList<Cuadrupla> cuadruplas = new ArrayList<Cuadrupla>();
+    static int contadorTemporales = 0;
+    static int contadorEtiquetas = 0;
+    static Stack<Integer> pilaSaltos = new Stack<Integer>();
+    static Stack<String> pilaTemporales = new Stack<String>();
+    static HashMap<String, String> tiposTemporales = new HashMap<String, String>();
+    
+    public static String generarTemporal() {
+        String temporal = "_t" + (++contadorTemporales);
+        return temporal;
+    }
+    
+    public static void setTipoTemporal(String temporal, String tipo) {
+        tiposTemporales.put(temporal, tipo);
+    }
+    
+    public static String getTipoTemporal(String temporal) {
+        if (!tiposTemporales.containsKey(temporal)) {
+            // Error interno: el temporal debió haber sido registrado con setTipoTemporal()
+            // Reportar como error semántico interno en lugar de asumir un tipo silenciosamente
+            CompiladorGamerCode.erroresSemanticos++;
+            CompiladorGamerCode.tabla.add(
+                "Error interno del compilador: tipo no registrado para el temporal '" + temporal + "'. " +
+                "Recuperación: verifique que todas las expresiones tengan tipo explícito."
+            );
+            return "error";
+        }
+        return tiposTemporales.get(temporal);
+    }
+    
+    public static String generarEtiqueta() {
+        return "L" + (++contadorEtiquetas);
+    }
+    
+    public static void agregarCuadrupla(String operador, String operando1, String operando2, String resultado) {
+        Cuadrupla cuadrupla = new Cuadrupla(operador, operando1, operando2, resultado, cuadruplas.size() + 1);
+        cuadruplas.add(cuadrupla);
+    }
+    
+    public static void agregarSalto(int direccion) {
+        pilaSaltos.push(direccion);
+    }
+    
+    public static int obtenerSalto() {
+        return pilaSaltos.pop();
+    }
+    
+    public static void agregarTemporal(String temporal) {
+        pilaTemporales.push(temporal);
+    }
+    
+    public static String obtenerTemporal() {
+        return pilaTemporales.pop();
+    }
+    
+    public static void escribirArchivo(String nombreArchivo) {
+        try {
+            java.io.FileWriter writer = new java.io.FileWriter(nombreArchivo);
+            writer.write("=== CÓDIGO INTERMEDIO - CUADRUPLAS ===\n\n");
+            writer.write("FORMATO: (línea) operador, operando1, operando2, resultado\n\n");
+            
+            for (Cuadrupla cuadrupla : cuadruplas) {
+                writer.write(cuadrupla.toString() + "\n");
+            }
+            
+            writer.write("\n=== RESUMEN ===\n");
+            writer.write("Total de cuadruplas generadas: " + cuadruplas.size() + "\n");
+            writer.write("Temporales utilizados: " + contadorTemporales + "\n");
+            writer.write("Etiquetas generadas: " + contadorEtiquetas + "\n");
+            
+            writer.close();
+            System.out.println("Código intermedio generado en: " + nombreArchivo);
+        } catch (Exception e) {
+            System.err.println("Error al escribir archivo de código intermedio: " + e.getMessage());
+        }
+    }
+    
+    public static void limpiar() {
+        cuadruplas.clear();
+        contadorTemporales = 0;
+        contadorEtiquetas = 0;
+        pilaSaltos.clear();
+        pilaTemporales.clear();
+        tiposTemporales.clear(); // Limpiar mapa de tipos
+    }
+}
+
+public class CompiladorGamerCode {
+    // Memoria del compilador: "nombre@scope" -> Objeto Simbolo
+    // Se usa clave compuesta para soportar shadowing correcto entre scopes anidados.
+    static java.util.HashMap<String, Simbolo> tablaSimbolos = new java.util.HashMap<String, Simbolo>();
+    // Stack para manejar scopes
+    static java.util.Stack<Integer> stackScopes = new java.util.Stack<Integer>();
+    static int scopeActual = 0;
+    public static int erroresSemanticos = 0;
+    
+    // —————————————————————————————
+    // Campos estáticos
+    // —————————————————————————————
+    static ArrayList<String> tabla = new ArrayList<String>();
+    public static int erroresLexicos     = 0;
+    public static int erroresSintacticos = 0;
+
+    //Metodo para reportar errores semánticos
+    public static void reportarErrorSemantico(String mensaje, Token t){
+        erroresSemanticos++;
+        String recuperacion = getSugerenciaRecuperacionSemantica(mensaje, t);
+        String errorCompleto = "Error Semántico (Tipo: " + mensaje + ") en linea " + t.beginLine + ", columna " + t.beginColumn 
+        + ". Recuperación: " + recuperacion;
+        tabla.add(errorCompleto);
+    }
+
+    // Método para dar sugerencias específicas de recuperación para errores semánticos
+    public static String getSugerenciaRecuperacionSemantica(String tipoError, Token t) {
+        if (tipoError.contains("Variable no declarada")) {
+            return "Declare la variable '" + t.image + "' antes de usarla o verifique la ortografía.";
+        } else if (tipoError.contains("Declaración duplicada")) {
+            return "Use un nombre diferente para la variable o elimine la declaración anterior.";
+        } else if (tipoError.contains("reasignar valor a la constante")) {
+            return "Las constantes no pueden modificar su valor. Use una variable si necesita cambiar el valor.";
+        } else if (tipoError.contains("Tipos incompatibles")) {
+            return "Asegúrese de que ambos lados de la asignación sean del mismo tipo o use conversión explícita.";
+        } else if (tipoError.contains("Operación aritmética inválida")) {
+            return "Verifique que ambos operandos sean numéricos (entero o decimal).";
+        } else if (tipoError.contains("Operación lógica inválida")) {
+            return "Verifique que ambos operandos sean booleanos (verdadero/falso).";
+        } else if (tipoError.contains("Comparación inválida")) {
+            return "Asegúrese de que los tipos sean comparables (numéricos con numéricos, texto con texto, etc.).";
+        } else if (tipoError.contains("Negación unaria inválida")) {
+            return "La negación aritmética (-) solo aplica a tipos numéricos.";
+        } else if (tipoError.contains("Negación lógica inválida")) {
+            return "La negación lógica (!) solo aplica a valores booleanos.";
+        } else if (tipoError.contains("Función no declarada")) {
+            return "Verifique que la función exista o esté declarada antes de usarla.";
+        } else if (tipoError.contains("no es una función")) {
+            return "'" + t.image + "' no es una función. Verifique la sintaxis de llamada.";
+        } else {
+            return "Revise la sintaxis y los tipos de datos involucrados.";
+        }
+    }
+
+    // Nombre de la última función declarada, para asociarle los parámetros durante el parseo
+    static String ultimaFuncionDeclarada = null;
+
+    // Registra el tipo de un parámetro en el símbolo de la función actualmente declarada.
+    // La función vive en el scope padre (stackScopes.peek()), no en el scope actual
+    // que ya fue abierto para los parámetros y el cuerpo.
+    public static void registrarTipoParametroFuncion(String tipoParam) {
+        if (ultimaFuncionDeclarada != null) {
+            // Buscar la función en el scope padre
+            int scopePadre = stackScopes.isEmpty() ? 0 : stackScopes.peek();
+            Simbolo simFuncion = tablaSimbolos.get(claveSimb(ultimaFuncionDeclarada, scopePadre));
+            if (simFuncion != null && simFuncion.categoria.equals("funcion")) {
+                simFuncion.tiposParametros.add(tipoParam);
+            }
+        }
+    }
+
+    // Métodos para manejo de la tabla de símbolos
+    // La clave interna es "nombre@scope" para soportar shadowing correcto.
+    private static String claveSimb(String nombre, int scope) {
+        return nombre + "@" + scope;
+    }
+
+    public static void agregarSimbolo(String nombre, String tipo, String categoria, boolean esConstante) {
+        Simbolo simbolo = new Simbolo(tipo, categoria, esConstante, scopeActual);
+        tablaSimbolos.put(claveSimb(nombre, scopeActual), simbolo);
+    }
+
+    // Busca el símbolo más cercano (scope más interno primero)
+    public static Simbolo buscarSimbolo(String nombre) {
+        // Recorrer los scopes desde el actual hasta el global (0)
+        java.util.List<Integer> scopesVisitados = new java.util.ArrayList<Integer>();
+        scopesVisitados.add(scopeActual);
+        for (int s : stackScopes) {
+            scopesVisitados.add(s);
+        }
+        for (int s : scopesVisitados) {
+            Simbolo sim = tablaSimbolos.get(claveSimb(nombre, s));
+            if (sim != null) return sim;
+        }
+        return null;
+    }
+
+    public static boolean existeSimboloEnScopeActual(String nombre) {
+        return tablaSimbolos.containsKey(claveSimb(nombre, scopeActual));
+    }
+
+    public static void entrarScope() {
+        stackScopes.push(scopeActual);
+        scopeActual++;
+    }
+
+    public static void salirScope() {
+        // Eliminar todos los símbolos del scope que está terminando
+        java.util.Iterator<String> it = tablaSimbolos.keySet().iterator();
+        while (it.hasNext()) {
+            String key = it.next();
+            if (tablaSimbolos.get(key).scope == scopeActual) {
+                it.remove();
+            }
+        }
+        scopeActual = stackScopes.pop();
+    }
+
+    // Métodos para obtención y verificación de tipos
+    public static String obtenerTipoExpresion(Object expr) {
+        String expresion = (String) expr;
+        
+        // Si es un nombre de variable o constante, obtener su tipo
+        Simbolo simbolo = buscarSimbolo(expresion);
+        if (simbolo != null) {
+            return simbolo.tipo;
+        }
+        
+        // Si es un temporal, obtener su tipo del mapa
+        // Los temporales usan prefijo "_t" para no colisionar con variables de usuario
+        if (expresion.startsWith("_t")) {
+            return GeneradorCodigoIntermedio.getTipoTemporal(expresion);
+        }
+        
+        // Para literales, inferir tipo
+        if (expresion.equals("verdadero") || expresion.equals("falso")) {
+            return "booleano";
+        }
+        if (expresion.startsWith("\"")) {
+            return "texto";
+        }
+        if (expresion.startsWith("'")) {
+            return "caracter";
+        }
+        if (expresion.contains(".")) {
+            return "decimal";
+        }
+        if (expresion.matches("-?\\d+")) {
+            return "entero";
+        }
+        
+        return expresion; // Para otros casos
+    }
+
+    public static boolean compatibles(String tipo1, String tipo2) {
+        if (tipo1.equals(tipo2)) return true;
+        // Permitir asignación de entero a decimal
+        if (tipo1.equals("decimal") && tipo2.equals("entero")) return true;
+        // Permitir asignación de decimal a entero (conversión segura)
+        if (tipo1.equals("entero") && tipo2.equals("decimal")) return true;
+        return false;
+    }
+
+    public static String verificarTipoAritmetico(String tipo1, String tipo2, String operador, Token t) {
+        // Solo se permiten operaciones aritméticas con tipos numéricos
+        if (!tipo1.equals("entero") && !tipo1.equals("decimal")) {
+            reportarErrorSemantico("Operación aritmética inválida. Tipo izquierdo '" + tipo1 + "' no es numérico", t);
+            return "error";
+        }
+        if (!tipo2.equals("entero") && !tipo2.equals("decimal")) {
+            reportarErrorSemantico("Operación aritmética inválida. Tipo derecho '" + tipo2 + "' no es numérico", t);
+            return "error";
+        }
+        
+        // Si alguno es decimal, el resultado es decimal
+        if (tipo1.equals("decimal") || tipo2.equals("decimal")) {
+            return "decimal";
+        }
+        return "entero";
+    }
+
+    public static String verificarTipoLogico(String tipo1, String tipo2, String operador, Token t) {
+        // Operaciones lógicas requieren tipos booleanos
+        if (!tipo1.equals("booleano")) {
+            reportarErrorSemantico("Operación lógica inválida. Tipo izquierdo '" + tipo1 + "' no es booleano", t);
+            return "error";
+        }
+        if (!tipo2.equals("booleano")) {
+            reportarErrorSemantico("Operación lógica inválida. Tipo derecho '" + tipo2 + "' no es booleano", t);
+            return "error";
+        }
+        return "booleano";
+    }
+
+    public static String verificarTipoComparacion(String tipo1, String tipo2, String operador, Token t) {
+        // Comparaciones requieren tipos compatibles
+        if (!compatibles(tipo1, tipo2) && !compatibles(tipo2, tipo1)) {
+            reportarErrorSemantico("Comparación inválida. Tipos '" + tipo1 + "' y '" + tipo2 + "' no son compatibles", t);
+            return "error";
+        }
+        return "booleano"; // Las comparaciones siempre devuelven booleano
+    }
+
+    // Método para imprimir la tabla de símbolos
+    public static void imprimirTablaSimbolos() {
+        System.out.println("\n=== TABLA DE SÍMBOLOS ===");
+        System.out.println("+----------------+----------------+----------------+----------------+----------------+");
+        System.out.println("| NOMBRE         | TIPO           | CATEGORÍA      | CONSTANTE      | SCOPE          |");
+        System.out.println("+----------------+----------------+----------------+----------------+----------------+");
+        
+        for (Map.Entry<String, Simbolo> entry : tablaSimbolos.entrySet()) {
+            // La clave interna tiene formato "nombre@scope"; mostrar solo el nombre
+            String clave = entry.getKey();
+            String nombre = clave.contains("@") ? clave.substring(0, clave.lastIndexOf('@')) : clave;
+            Simbolo simbolo = entry.getValue();
+            
+            System.out.printf("| %-14s | %-14s | %-14s | %-14s | %-14s |\n",
+                nombre.length() > 14 ? nombre.substring(0, 14) : nombre,
+                simbolo.tipo.length() > 14 ? simbolo.tipo.substring(0, 14) : simbolo.tipo,
+                simbolo.categoria.length() > 14 ? simbolo.categoria.substring(0, 14) : simbolo.categoria,
+                simbolo.esConstante ? "Sí" : "No",
+                "scope_" + simbolo.scope
+            );
+        }
+        
+        System.out.println("+----------------+----------------+----------------+----------------+----------------+");
+        System.out.println("Total de símbolos: " + tablaSimbolos.size());
+        System.out.println("========================\n");
+    }
+
+    // —————————————————————————————
+    // Método principal
+    // —————————————————————————————
+    public static void main(String[] args) {
+        // Forzar UTF-8 en la salida estándar y de error para evitar caracteres rotos
+        // en consolas Windows que usan Cp1252 por defecto
+        try {
+            System.setOut(new java.io.PrintStream(System.out, true, "UTF-8"));
+            System.setErr(new java.io.PrintStream(System.err, true, "UTF-8"));
+        } catch (java.io.UnsupportedEncodingException e) {
+            // UTF-8 siempre está disponible en cualquier JVM, nunca debería ocurrir
+        }
+
+        CompiladorGamerCode parser = null;
+        try {
+            if (args.length > 0) {
+                FileInputStream fileInput = new FileInputStream(args[0]);
+                parser = new CompiladorGamerCode(fileInput);
+                System.out.println("Analizando archivo: " + args[0]);
+            }
+            
+            // Inicializar generador de código intermedio
+            GeneradorCodigoIntermedio.limpiar();
+            
+            parser.Programa();
+
+        } catch (FileNotFoundException e) {
+            System.err.println("Error: No se pudo encontrar el archivo " + args[0]);
+            System.exit(1);
+        } catch (ParseException e) {
+            erroresSintacticos++;
+            tabla.add(traducirMensaje(e.getMessage()));
+        }
+        
+        // Generar código intermedio SOLO si el programa no tiene errores.
+        // Un compilador no debe producir salida cuando el código fuente es inválido.
+        if (erroresLexicos == 0 && erroresSintacticos == 0 && erroresSemanticos == 0) {
+            String nombreArchivoSalida    = args.length > 1 ? args[1] : "codigo_intermedio.txt";
+            String nombreArchivoOptimizado = args.length > 2 ? args[2] : "codigo_optimizado.txt";
+            String nombreArchivoC          = args.length > 3 ? args[3] : "output.c";
+            String nombreArchivoExe        = args.length > 4 ? args[4] : "output.exe";
+
+            // Escribir código intermedio sin optimizar
+            GeneradorCodigoIntermedio.escribirArchivo(nombreArchivoSalida);
+
+            // --- PASO 1: Optimización global de expresiones ---
+            // Aplica plegado de constantes, simplificaciones algebraicas,
+            // eliminación de subexpresiones comunes (CSE) y propagación de copias.
+            System.out.println("\n=== PASO 1: OPTIMIZACIÓN GLOBAL DE EXPRESIONES ===");
+            int antesExpr = GeneradorCodigoIntermedio.cuadruplas.size();
+            ArrayList<Cuadrupla> cuadruplasExprOpt =
+                OptimizadorGlobal.optimizar(GeneradorCodigoIntermedio.cuadruplas);
+            int despuesExpr = cuadruplasExprOpt.size();
+            System.out.println("Cuádruplas antes:   " + antesExpr);
+            System.out.println("Cuádruplas después: " + despuesExpr);
+            System.out.println("Reducción: " + (antesExpr - despuesExpr) + " cuádruplas eliminadas");
+
+            // --- PASO 2: Optimización global de asignación de registros ---
+            // Aplica análisis de rangos de vida, grafo de interferencia y
+            // coloración de grafos para asignar registros R0-R7.
+            ArrayList<Cuadrupla> cuadruplasRegOpt =
+                OptimizadorRegistros.optimizar(cuadruplasExprOpt);
+
+            // Generar archivo de código completamente optimizado con todas las etapas
+            OptimizadorRegistros.escribirArchivoOptimizadoCompleto(
+                GeneradorCodigoIntermedio.cuadruplas,
+                cuadruplasExprOpt,
+                cuadruplasRegOpt,
+                nombreArchivoOptimizado
+            );
+
+            // --- PASO 3: Generación de código C (Opción B) ---
+            // Traduce las cuádruplas con registros R0-R7 a código C válido
+            // y opcionalmente lo compila con gcc (MinGW) para generar un ejecutable.
+            System.out.println("\n=== PASO 3: GENERACIÓN DE CÓDIGO C ===");
+            GeneradorCodigoC.generar(cuadruplasExprOpt, nombreArchivoC);
+            GeneradorCodigoC.compilar(nombreArchivoC, nombreArchivoExe);
+        }
+        
+        // —————————————————————————————
+        // Resumen final de errores
+        // —————————————————————————————
+        
+        // Imprimir tabla de símbolos
+        imprimirTablaSimbolos();
+        
+        if (erroresLexicos == 0 && erroresSintacticos == 0 && erroresSemanticos == 0) {
+            System.out.println("Análisis léxico - sintáctico - semántico completado con éxito.");
+            System.out.println("No se detectaron errores.");
+        } else {
+            System.out.println("Análisis léxico - sintáctico - semántico completado con errores.");
+            System.out.println("Se detectaron:");
+            System.out.println("- " + erroresLexicos + " error(es) léxico(s)");
+            System.out.println("- " + erroresSintacticos + " error(es) sintáctico(s)");
+            System.out.println("- " + erroresSemanticos + " error(es) semántico(s)");
+            System.out.println("Detalle de errores:");
+            for (String err : tabla) {
+                System.out.println(err);
+            }
+        }
+    }
+
+    // —————————————————————————————
+    // Traductor de mensajes de ParseException
+    // —————————————————————————————
+    public static String traducirMensaje(String mensaje) {
+        // Corregir reporte de línea para errores de punto y coma faltante
+        if (mensaje.contains("Encountered") && mensaje.contains("\";\"")) {
+            // Extraer información del error original
+            String lineaOriginal = extraerLinea(mensaje);
+            
+            // Para errores de punto y coma, ajustar a la línea anterior
+            int lineaCorregida = Integer.parseInt(lineaOriginal) - 1;
+            if (lineaCorregida < 1) lineaCorregida = 1;
+            
+            String sugerencia = ". Recuperación: Agregue un punto y coma (;) al final de la instrucción.";
+            return "Error sintáctico. Se encontro " + extraerTokenEncontrado(mensaje) + 
+                   " en la linea " + lineaCorregida + ", columna 3" +
+                   ". Se esperaba: \";\" ..." + sugerencia;
+        } else if (mensaje.contains("Encountered")) {
+            mensaje = mensaje.replace("Encountered", "Error sintáctico. Se encontró");
+        }
+        if (mensaje.contains("at line")) {
+            mensaje = mensaje.replace("at line", "en la linea");
+        }
+        if (mensaje.contains("column") && !mensaje.contains("columna")) {
+            mensaje = mensaje.replace("column", "columna");
+        }
+        if (mensaje.contains("Was expecting:")) {
+            mensaje = mensaje.replace("Was expecting:", "Se esperaba:");
+        }
+        if (mensaje.contains("Was expecting one of:")) {
+            mensaje = mensaje.replace("Was expecting one of:", "Se esperaba una de estas opciones:");
+        }
+        
+        // Agregar sugerencia de recuperación sintáctica
+        mensaje += getSugerenciaRecuperacionSintactica(mensaje);
+        
+        return mensaje;
+    }
+    
+    // Métodos auxiliares para extraer información del mensaje de ParseException
+    public static String extraerLinea(String mensaje) {
+        int inicio = mensaje.indexOf("line ") + 5;
+        int fin = mensaje.indexOf(",", inicio);
+        if (inicio > 4 && fin > inicio) {
+            return mensaje.substring(inicio, fin);
+        }
+        return "1";
+    }
+    
+    public static String extraerColumna(String mensaje) {
+        int inicio = mensaje.indexOf("column ") + 7;
+        int fin = mensaje.indexOf(".", inicio);
+        if (inicio > 6 && fin > inicio) {
+            return mensaje.substring(inicio, fin);
+        }
+        return "1";
+    }
+    
+    public static String extraerTokenEncontrado(String mensaje) {
+        int inicio = mensaje.indexOf("Encountered ") + 11;
+        int fin = mensaje.indexOf(" at line", inicio);
+        if (inicio > 10 && fin > inicio) {
+            return mensaje.substring(inicio, fin);
+        }
+        return "token";
+    }
+    
+    // Método para dar sugerencias específicas de recuperación para errores sintácticos
+    public static String getSugerenciaRecuperacionSintactica(String mensaje) {
+        if (mensaje.contains("\";\"")) {
+            return ". Recuperación: Agregue un punto y coma (;) al final de la instrucción.";
+        } else if (mensaje.contains("\"(\"") || mensaje.contains("\")\"")) {
+            return ". Recuperación: Verifique que todos los paréntesis estén correctamente balanceados.";
+        } else if (mensaje.contains("\"{\"") || mensaje.contains("\"}\"")) {
+            return ". Recuperación: Asegúrese de que todas las llaves estén correctamente balanceadas.";
+        } else if (mensaje.contains("\"inicio\"")) {
+            return ". Recuperación: El programa debe comenzar con la palabra reservada 'inicio'.";
+        } else if (mensaje.contains("\"fin\"")) {
+            return ". Recuperación: El programa debe terminar con la palabra reservada 'fin'.";
+        } else if (mensaje.contains("si")) {
+            return ". Recuperación: Verifique la sintaxis: si (condición) { bloque } [si_no { bloque }].";
+        } else if (mensaje.contains("mientras")) {
+            return ". Recuperación: Verifique la sintaxis: mientras (condición) { bloque }.";
+        } else if (mensaje.contains("para")) {
+            return ". Recuperación: Verifique la sintaxis: para (inicialización; condición; actualización) { bloque }.";
+        } else if (mensaje.contains("fun")) {
+            return ". Recuperación: Verifique la sintaxis: fun nombre(parámetros) { bloque }.";
+        } else {
+            return ". Recuperación: Revise la sintaxis de la instrucción actual.";
+        }
+    }
+
+    // —————————————————————————————
+    // Método de sincronización tras error
+    // —————————————————————————————
+    public static void saltar_hasta(int... tipos) {
+        Token t;
+        int tokensSkipped = 0;
+        final int MAX_SKIP = 50; // Evitar bucles infinitos
+        
+        while (tokensSkipped < MAX_SKIP) {
+            try {
+                t = getNextToken();
+                tokensSkipped++;
+                
+                if (t.kind == EOF) {
+                    return;
+                }
+                
+                for (int tipo : tipos) {
+                    if (t.kind == tipo) {
+                        // Retroceder un token para que la siguiente regla lo pueda consumir
+                        token = t;
+                        return;
+                    }
+                }
+            } catch (Exception e) {
+                // Si hay problemas leyendo tokens, salir
+                return;
+            }
+        }
+    }
+
+    // —————————————————————————————
+    // Método auxiliar para reportar errores sintácticos
+    // —————————————————————————————
+    public static void reportarErrorSintactico(String mensaje) {
+        erroresSintacticos++;
+        tabla.add(traducirMensaje(mensaje));
+    }
+}
+
+// Clase para optimización global: Simplificación de Expresiones
+// Incluye: plegado de constantes, simplificaciones algebraicas,
+//          eliminación de subexpresiones comunes (CSE) y propagación de copias.
+class OptimizadorGlobal {
+
+    static HashMap<String, String> expresionesCalculadas = new HashMap<String, String>();
+    static HashMap<String, String> valoresConstantes     = new HashMap<String, String>();
+
+    static final java.util.Set<String> OPS_ARITMETICAS = new java.util.HashSet<String>(
+        java.util.Arrays.asList("SUMA", "RESTA", "MULT", "DIV", "DIV_ENT", "MOD")
+    );
+
+    public static ArrayList<Cuadrupla> optimizar(ArrayList<Cuadrupla> cuadruplas) {
+        expresionesCalculadas.clear();
+        valoresConstantes.clear();
+
+        ArrayList<Cuadrupla> resultado = new ArrayList<Cuadrupla>();
+        for (Cuadrupla c : cuadruplas) {
+            Cuadrupla optimizada = procesarCuadrupla(c);
+            if (optimizada != null) resultado.add(optimizada);
+        }
+
+        // Segunda pasada: eliminar temporales huerfanos.
+        // El plegado colapsa "_t = 3+4" en "_t = 7" pero los temporales
+        // de los operandos literales (_t1=3, _t2=4) quedan sin usos.
+        // Contamos usos de cada temporal y eliminamos los que solo tienen
+        // una definicion y cero usos posteriores.
+        java.util.HashMap<String, Integer> usos = new java.util.HashMap<String, Integer>();
+        for (Cuadrupla c : resultado) {
+            if (c.operando1 != null && c.operando1.startsWith("_t"))
+                usos.put(c.operando1, usos.getOrDefault(c.operando1, 0) + 1);
+            if (c.operando2 != null && c.operando2.startsWith("_t"))
+                usos.put(c.operando2, usos.getOrDefault(c.operando2, 0) + 1);
+        }
+        ArrayList<Cuadrupla> sinHuerfanos = new ArrayList<Cuadrupla>();
+        for (Cuadrupla c : resultado) {
+            // Eliminar solo asignaciones simples (operador "=") de temporales sin usos
+            boolean esDefTemporal = c.resultado != null && c.resultado.startsWith("_t")
+                && c.operador.equals("=");
+            if (esDefTemporal && !usos.containsKey(c.resultado)) {
+                System.out.println("[OPT-EXPR] Temporal huerfano eliminado: " + c);
+                continue;
+            }
+            sinHuerfanos.add(c);
+        }
+
+        // Renumerar líneas
+        for (int i = 0; i < sinHuerfanos.size(); i++) sinHuerfanos.get(i).linea = i + 1;
+        return sinHuerfanos;
+    }
+
+    static Cuadrupla procesarCuadrupla(Cuadrupla c) {
+        // Invalidar CSE y propagación de copias en fronteras de flujo de control.
+        // Una etiqueta puede ser destino de un salto desde cualquier parte del programa,
+        // por lo que las expresiones calculadas antes del salto no son válidas aquí.
+        boolean esFronteraFlujo = c.operador.equals("LABEL") || c.operador.equals("GOTO")
+            || c.operador.equals("IF_FALSE") || c.operador.equals("IF_TRUE")
+            || c.operador.equals("BEGIN_FUNC") || c.operador.equals("END_FUNC")
+            || c.operador.equals("RETURN");
+        if (esFronteraFlujo) {
+            // Al cruzar una frontera de flujo (LABEL, GOTO, IF_FALSE, etc.) se invalida:
+            //   - El mapa CSE: una expresion calculada antes del salto puede no ser valida aqui.
+            //   - Los valores de VARIABLES DE USUARIO: pueden haber cambiado en otra iteracion.
+            // PERO se conservan los literales constantes (_tN = literal) porque un literal
+            // numerico/booleano es siempre el mismo independientemente del flujo de control.
+            expresionesCalculadas.clear();
+            java.util.Iterator<java.util.Map.Entry<String,String>> it =
+                valoresConstantes.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry<String,String> entry = it.next();
+                String var = entry.getKey();
+                String val = entry.getValue();
+                // Conservar solo entradas donde la variable ES un temporal
+                // y su valor es un literal (numerico, texto, booleano).
+                boolean esTemporal = var.startsWith("_t");
+                boolean esLiteral  = esNumerico(val)
+                    || val.equals("verdadero") || val.equals("falso")
+                    || (val.length() >= 2 && val.charAt(0) == (char)34 && val.charAt(val.length()-1) == (char)34);
+                if (!(esTemporal && esLiteral)) {
+                    it.remove();
+                }
+            }
+            return c;
+        }
+
+        // 0. SUSTITUCION DE OPERANDOS PROPAGADOS
+        // Antes de aplicar cualquier optimizacion, reescribir los operandos
+        // de la cuadrupla con los valores que ya conocemos del mapa de constantes.
+        // Esto hace que la cuadrupla de SALIDA ya tenga los valores propagados,
+        // y permite que plegado/algebra/CSE trabajen sobre datos actualizados.
+        if (c.operando1 != null && !c.operando1.equals("-")) {
+            String v1prop = resolverValor(c.operando1);
+            if (!v1prop.equals(c.operando1)) {
+                c = new Cuadrupla(c.operador, v1prop, c.operando2, c.resultado, c.linea);
+            }
+        }
+        if (c.operando2 != null && !c.operando2.equals("-")) {
+            String v2prop = resolverValor(c.operando2);
+            if (!v2prop.equals(c.operando2)) {
+                c = new Cuadrupla(c.operador, c.operando1, v2prop, c.resultado, c.linea);
+            }
+        }
+
+        // 1. PLEGADO DE CONSTANTES
+        if (OPS_ARITMETICAS.contains(c.operador)) {
+            String v1 = resolverValor(c.operando1);
+            String v2 = resolverValor(c.operando2);
+            if (esNumerico(v1) && esNumerico(v2)) {
+                try {
+                    double n1 = Double.parseDouble(v1);
+                    double n2 = Double.parseDouble(v2);
+                    double r  = calcular(c.operador, n1, n2);
+                    String valorResult = (r == Math.floor(r) && !Double.isInfinite(r))
+                        ? String.valueOf((long) r) : String.valueOf(r);
+                    valoresConstantes.put(c.resultado, valorResult);
+                    Cuadrupla plegada = new Cuadrupla("=", valorResult, "-", c.resultado, c.linea);
+                    System.out.println("[OPT-EXPR] Plegado de constantes: " + c + "  ->  " + plegada);
+                    return plegada;
+                } catch (Exception ignored) {}
+            }
+        }
+        // 2. SIMPLIFICACIONES ALGEBRAICAS
+        if (OPS_ARITMETICAS.contains(c.operador)) {
+            String v1 = resolverValor(c.operando1);
+            String v2 = resolverValor(c.operando2);
+            String simplificado = simplificacionAlgebraica(c.operador, v1, v2, c.operando1, c.operando2);
+            if (simplificado != null) {
+                valoresConstantes.put(c.resultado, resolverValor(simplificado));
+                Cuadrupla alg = new Cuadrupla("=", simplificado, "-", c.resultado, c.linea);
+                System.out.println("[OPT-EXPR] Simplificacion algebraica: " + c + "  ->  " + alg);
+                return alg;
+            }
+        }
+        // 3. ELIMINACION DE SUBEXPRESIONES COMUNES (CSE)
+        if (OPS_ARITMETICAS.contains(c.operador)
+                || c.operador.equals("EQ") || c.operador.equals("NE")
+                || c.operador.equals("LT") || c.operador.equals("GT")
+                || c.operador.equals("LE") || c.operador.equals("GE")
+                || c.operador.equals("AND") || c.operador.equals("OR")) {
+            // Clave con operandos resueltos: "a+b" tras propagar a=7,b=20 da "7+20",
+            // igual que la segunda ocurrencia -> CSE la detecta como subexpresion comun.
+            String op1Res = resolverValor(c.operando1);
+            String op2Res = resolverValor(c.operando2);
+            String claveResuelta  = claveExpresion(c.operador, op1Res, op2Res);
+            String claveOriginal  = claveExpresion(c.operador, c.operando1, c.operando2);
+            String tempCSE = expresionesCalculadas.containsKey(claveResuelta)
+                           ? expresionesCalculadas.get(claveResuelta)
+                           : expresionesCalculadas.get(claveOriginal);
+            if (tempCSE != null) {
+                Cuadrupla cse = new Cuadrupla("=", tempCSE, "-", c.resultado, c.linea);
+                System.out.println("[OPT-EXPR] CSE - subexpresion comun: " + c + "  ->  " + cse);
+                valoresConstantes.put(c.resultado, resolverValor(tempCSE));
+                return cse;
+            } else {
+                expresionesCalculadas.put(claveResuelta, c.resultado);
+                expresionesCalculadas.put(claveOriginal, c.resultado);
+            }
+        }
+        // 4. PROPAGACION DE COPIAS
+        if (c.operador.equals("=") && c.operando2.equals("-")) {
+            String valorSource = resolverValor(c.operando1);
+            // Registrar el valor del destino en el mapa
+            if (esNumerico(valorSource) || valorSource.equals("verdadero") || valorSource.equals("falso")
+                    || (valorSource.length() >= 2 && valorSource.charAt(0) == (char)34
+                        && valorSource.charAt(valorSource.length()-1) == (char)34)) {
+                valoresConstantes.put(c.resultado, valorSource);
+            } else if (!valorSource.equals(c.resultado)) {
+                // Es una copia de variable: propagar el alias
+                valoresConstantes.put(c.resultado, valorSource);
+            }
+            // Reescribir la cuadrupla con el valor ya resuelto si cambio
+            if (!valorSource.equals(c.operando1)) {
+                return new Cuadrupla("=", valorSource, "-", c.resultado, c.linea);
+            }
+        }
+        return c;
+    }
+
+    static String resolverValor(String operando) {
+        if (operando == null || operando.equals("-")) return operando;
+        if (valoresConstantes.containsKey(operando)) return valoresConstantes.get(operando);
+        return operando;
+    }
+
+    static boolean esNumerico(String s) {
+        if (s == null) return false;
+        try { Double.parseDouble(s); return true; }
+        catch (NumberFormatException e) { return false; }
+    }
+
+    static double calcular(String op, double a, double b) {
+        switch (op) {
+            case "SUMA":    return a + b;
+            case "RESTA":   return a - b;
+            case "MULT":    return a * b;
+            case "DIV":     return b != 0 ? a / b : 0;
+            case "DIV_ENT": return b != 0 ? (long)(a / b) : 0;
+            case "MOD":     return b != 0 ? a % b : 0;
+            default: throw new RuntimeException("Operador no soportado: " + op);
+        }
+    }
+
+    static String simplificacionAlgebraica(String op, String v1, String v2,
+                                            String orig1, String orig2) {
+        switch (op) {
+            case "SUMA":
+                if ("0".equals(v2) || "0.0".equals(v2)) return orig1;
+                if ("0".equals(v1) || "0.0".equals(v1)) return orig2;
+                break;
+            case "RESTA":
+                if ("0".equals(v2) || "0.0".equals(v2)) return orig1;
+                break;
+            case "MULT":
+                if ("1".equals(v2) || "1.0".equals(v2)) return orig1;
+                if ("1".equals(v1) || "1.0".equals(v1)) return orig2;
+                if ("0".equals(v2) || "0.0".equals(v2)) return "0";
+                if ("0".equals(v1) || "0.0".equals(v1)) return "0";
+                break;
+            case "DIV": case "DIV_ENT":
+                if ("1".equals(v2) || "1.0".equals(v2)) return orig1;
+                if ("0".equals(v1) || "0.0".equals(v1)) return "0";
+                break;
+            case "MOD":
+                if ("1".equals(v2) || "1.0".equals(v2)) return "0";
+                break;
+        }
+        return null;
+    }
+
+    static String claveExpresion(String op, String op1, String op2) {
+        if (op.equals("SUMA") || op.equals("MULT")) {
+            if (op1.compareTo(op2) > 0) { String tmp = op1; op1 = op2; op2 = tmp; }
+        }
+        return op + "|" + op1 + "|" + op2;
+    }
+}
+
+// Clase para optimización de código: Asignación de Registros Global
+class OptimizadorRegistros {
+    // Información de rango de vida para cada variable/temporal
+    static class LiveRange {
+        String variable;
+        int def;    // línea donde se define
+        int use;    // última línea donde se usa
+        ArrayList<Integer> uses; // todas las líneas donde se usa
+        
+        public LiveRange(String variable, int def) {
+            this.variable = variable;
+            this.def = def;
+            this.use = def;
+            this.uses = new ArrayList<Integer>();
+            this.uses.add(def);
+        }
+    }
+    
+    // Bloque básico para análisis de flujo de control
+    static class BloqueBasico {
+        int id;                     // identificador único del bloque
+        int inicio;                 // índice de la primera cuádrupla
+        int fin;                    // índice de la última cuádrupla
+        ArrayList<BloqueBasico> predecesores;
+        ArrayList<BloqueBasico> sucesores;
+        ArrayList<String> liveIn;  // variables vivas al entrar al bloque
+        ArrayList<String> liveOut; // variables vivas al salir del bloque
+        
+        public BloqueBasico(int id, int inicio, int fin) {
+            this.id = id;
+            this.inicio = inicio;
+            this.fin = fin;
+            this.predecesores = new ArrayList<BloqueBasico>();
+            this.sucesores = new ArrayList<BloqueBasico>();
+            this.liveIn = new ArrayList<String>();
+            this.liveOut = new ArrayList<String>();
+        }
+    }
+    
+    // Grafo de interferencia
+    static class GrafoInterferencia {
+        HashMap<String, ArrayList<String>> adyacencia;
+        
+        public GrafoInterferencia() {
+            adyacencia = new HashMap<String, ArrayList<String>>();
+        }
+        
+        public void agregarNodo(String var) {
+            if (!adyacencia.containsKey(var)) {
+                adyacencia.put(var, new ArrayList<String>());
+            }
+        }
+        
+        public void agregarArista(String var1, String var2) {
+            if (!var1.equals(var2)) {
+                agregarNodo(var1);
+                agregarNodo(var2);
+                if (!adyacencia.get(var1).contains(var2)) {
+                    adyacencia.get(var1).add(var2);
+                }
+                if (!adyacencia.get(var2).contains(var1)) {
+                    adyacencia.get(var2).add(var1);
+                }
+            }
+        }
+        
+        public int getGrado(String var) {
+            return adyacencia.containsKey(var) ? adyacencia.get(var).size() : 0;
+        }
+        
+        public void eliminarNodo(String var) {
+            if (adyacencia.containsKey(var)) {
+                ArrayList<String> vecinos = adyacencia.get(var);
+                for (String vecino : vecinos) {
+                    adyacencia.get(vecino).remove(var);
+                }
+                adyacencia.remove(var);
+            }
+        }
+    }
+    
+    static HashMap<String, LiveRange> liveRanges;
+    static GrafoInterferencia grafo;
+    static HashMap<String, String> asignacionRegistros;
+    static final int NUM_REGISTROS = 8; // R0-R7
+    static ArrayList<BloqueBasico> bloquesBasicos;
+    static HashMap<String, BloqueBasico> mapaEtiquetas; // etiqueta -> bloque
+    
+    // Paso 1.1: Identificar bloques básicos
+    public static void identificarBloquesBasicos(ArrayList<Cuadrupla> cuadruplas) {
+        bloquesBasicos = new ArrayList<BloqueBasico>();
+        mapaEtiquetas = new HashMap<String, BloqueBasico>();
+        
+        // Identificar lideres de bloque
+        java.util.HashSet<Integer> lideres = new java.util.HashSet<Integer>();
+        lideres.add(0); // La primera instrucción es siempre un líder
+        
+        for (int i = 0; i < cuadruplas.size(); i++) {
+            Cuadrupla c = cuadruplas.get(i);
+            
+            // Los objetivos de saltos son lideres (etiquetas)
+            if (c.operador.equals("LABEL") && c.resultado != null) {
+                lideres.add(i);
+                mapaEtiquetas.put(c.resultado, null); // Se asignará después
+            }
+            
+            // Las instrucciones después de saltos son lideres
+            if (c.operador.equals("GOTO") || c.operador.equals("IF_FALSE") || 
+                c.operador.equals("IF_TRUE") || c.operador.equals("REGRESA")) {
+                if (i + 1 < cuadruplas.size()) {
+                    lideres.add(i + 1);
+                }
+            }
+        }
+        
+        // Convertir lideres a lista ordenada
+        ArrayList<Integer> listaLideres = new ArrayList<Integer>(lideres);
+        java.util.Collections.sort(listaLideres);
+        
+        // Crear bloques básicos
+        for (int i = 0; i < listaLideres.size(); i++) {
+            int inicio = listaLideres.get(i);
+            int fin = (i + 1 < listaLideres.size()) ? listaLideres.get(i + 1) - 1 : cuadruplas.size() - 1;
+            BloqueBasico bloque = new BloqueBasico(i, inicio, fin);
+            bloquesBasicos.add(bloque);
+        }
+        
+        // Asignar bloques a etiquetas
+        for (BloqueBasico bloque : bloquesBasicos) {
+            Cuadrupla primera = cuadruplas.get(bloque.inicio);
+            if (primera.operador.equals("LABEL") && primera.resultado != null) {
+                mapaEtiquetas.put(primera.resultado, bloque);
+            }
+        }
+        
+        System.out.println("Bloques básicos identificados: " + bloquesBasicos.size());
+    }
+    
+    // Paso 1.2: Construir grafo de flujo de control (CFG)
+    public static void construirCFG(ArrayList<Cuadrupla> cuadruplas) {
+        for (int i = 0; i < bloquesBasicos.size(); i++) {
+            BloqueBasico bloque = bloquesBasicos.get(i);
+            Cuadrupla ultima = cuadruplas.get(bloque.fin);
+            
+            // Determinar sucesores
+            if (ultima.operador.equals("GOTO") && ultima.resultado != null) {
+                // Salto incondicional a etiqueta
+                BloqueBasico destino = mapaEtiquetas.get(ultima.resultado);
+                if (destino != null) {
+                    bloque.sucesores.add(destino);
+                    destino.predecesores.add(bloque);
+                }
+            } else if (ultima.operador.equals("IF_FALSE") && ultima.resultado != null) {
+                // Salto condicional falso
+                BloqueBasico destinoFalse = mapaEtiquetas.get(ultima.resultado);
+                if (destinoFalse != null) {
+                    bloque.sucesores.add(destinoFalse);
+                    destinoFalse.predecesores.add(bloque);
+                }
+                // Fall-through al siguiente bloque
+                if (i + 1 < bloquesBasicos.size()) {
+                    BloqueBasico siguiente = bloquesBasicos.get(i + 1);
+                    bloque.sucesores.add(siguiente);
+                    siguiente.predecesores.add(bloque);
+                }
+            } else if (ultima.operador.equals("IF_TRUE") && ultima.resultado != null) {
+                // Salto condicional verdadero
+                BloqueBasico destinoTrue = mapaEtiquetas.get(ultima.resultado);
+                if (destinoTrue != null) {
+                    bloque.sucesores.add(destinoTrue);
+                    destinoTrue.predecesores.add(bloque);
+                }
+                // Fall-through al siguiente bloque
+                if (i + 1 < bloquesBasicos.size()) {
+                    BloqueBasico siguiente = bloquesBasicos.get(i + 1);
+                    bloque.sucesores.add(siguiente);
+                    siguiente.predecesores.add(bloque);
+                }
+            } else if (ultima.operador.equals("REGRESA")) {
+                // Fin de función, no hay sucesores
+            } else {
+                // Fall-through al siguiente bloque
+                if (i + 1 < bloquesBasicos.size()) {
+                    BloqueBasico siguiente = bloquesBasicos.get(i + 1);
+                    bloque.sucesores.add(siguiente);
+                    siguiente.predecesores.add(bloque);
+                }
+            }
+        }
+        
+        System.out.println("CFG construido con " + bloquesBasicos.size() + " bloques");
+    }
+    
+    // Paso 1.3: Análisis de liveness usando data-flow analysis
+    public static void analizarLiveness(ArrayList<Cuadrupla> cuadruplas) {
+        // Inicializar liveIn y liveOut vacíos
+        for (BloqueBasico bloque : bloquesBasicos) {
+            bloque.liveIn.clear();
+            bloque.liveOut.clear();
+        }
+        
+        boolean cambio = true;
+        while (cambio) {
+            cambio = false;
+            
+            // Procesar en orden inverso para convergencia más rápida
+            for (int i = bloquesBasicos.size() - 1; i >= 0; i--) {
+                BloqueBasico bloque = bloquesBasicos.get(i);
+                
+                // liveOut[B] = U (liveIn[S] para todos los sucesores S de B)
+                ArrayList<String> nuevoLiveOut = new ArrayList<String>();
+                for (BloqueBasico sucesor : bloque.sucesores) {
+                    for (String var : sucesor.liveIn) {
+                        if (!nuevoLiveOut.contains(var)) {
+                            nuevoLiveOut.add(var);
+                        }
+                    }
+                }
+                
+                // Calcular def y use del bloque usando pasada HACIA ADELANTE (algoritmo estándar).
+                // use[B]  = variables usadas antes de ser definidas en B.
+                // def[B]  = variables definidas en B (antes de cualquier uso en B).
+                // Procesar en orden directo (instrucción 0 → N) para respetar
+                // el flujo real de ejecución dentro del bloque.
+                ArrayList<String> def = new ArrayList<String>();
+                ArrayList<String> use = new ArrayList<String>();
+                
+                for (int j = bloque.inicio; j <= bloque.fin; j++) {
+                    Cuadrupla c = cuadruplas.get(j);
+                    
+                    // Los operandos son usos
+                    if (debeOptimizarse(c.operando1)) {
+                        if (!def.contains(c.operando1) && !use.contains(c.operando1)) {
+                            use.add(c.operando1);
+                        }
+                    }
+                    if (debeOptimizarse(c.operando2)) {
+                        if (!def.contains(c.operando2) && !use.contains(c.operando2)) {
+                            use.add(c.operando2);
+                        }
+                    }
+                    
+                    // El resultado es una definición
+                    if (debeOptimizarse(c.resultado)) {
+                        if (!def.contains(c.resultado)) {
+                            def.add(c.resultado);
+                        }
+                    }
+                }
+                
+                // liveIn[B] = use[B] U (liveOut[B] - def[B])
+                ArrayList<String> nuevoLiveIn = new ArrayList<String>(use);
+                for (String var : nuevoLiveOut) {
+                    if (!def.contains(var) && !nuevoLiveIn.contains(var)) {
+                        nuevoLiveIn.add(var);
+                    }
+                }
+                
+                // Verificar si hubo cambios
+                if (!nuevoLiveOut.equals(bloque.liveOut) || !nuevoLiveIn.equals(bloque.liveIn)) {
+                    cambio = true;
+                    bloque.liveOut = nuevoLiveOut;
+                    bloque.liveIn = nuevoLiveIn;
+                }
+            }
+        }
+        
+        System.out.println("Análisis de liveness completado");
+    }
+    
+    // Paso 1: Análisis de rangos de vida (Live Range Analysis) - OBSOLETO, usar análisis de liveness
+    public static void analizarLiveRanges(ArrayList<Cuadrupla> cuadruplas) {
+        liveRanges = new HashMap<String, LiveRange>();
+        
+        // Primera pasada: encontrar definiciones
+        for (int i = 0; i < cuadruplas.size(); i++) {
+            Cuadrupla c = cuadruplas.get(i);
+            
+            // El resultado es una definición
+            if (debeOptimizarse(c.resultado)) {
+                if (!liveRanges.containsKey(c.resultado)) {
+                    liveRanges.put(c.resultado, new LiveRange(c.resultado, i));
+                } else {
+                    liveRanges.get(c.resultado).def = i;
+                    liveRanges.get(c.resultado).uses.add(i);
+                }
+            }
+        }
+        
+        // Segunda pasada: encontrar usos
+        for (int i = 0; i < cuadruplas.size(); i++) {
+            Cuadrupla c = cuadruplas.get(i);
+            
+            // Operando1 es un uso
+            if (debeOptimizarse(c.operando1)) {
+                if (!liveRanges.containsKey(c.operando1)) {
+                    liveRanges.put(c.operando1, new LiveRange(c.operando1, i));
+                }
+                LiveRange lr = liveRanges.get(c.operando1);
+                lr.use = Math.max(lr.use, i);
+                lr.uses.add(i);
+            }
+            
+            // Operando2 es un uso
+            if (debeOptimizarse(c.operando2)) {
+                if (!liveRanges.containsKey(c.operando2)) {
+                    liveRanges.put(c.operando2, new LiveRange(c.operando2, i));
+                }
+                LiveRange lr = liveRanges.get(c.operando2);
+                lr.use = Math.max(lr.use, i);
+                lr.uses.add(i);
+            }
+        }
+    }
+    
+    // Verificar si una variable o temporal debe ser asignado a un registro
+    private static boolean debeOptimizarse(String var) {
+        if (var == null || var.equals("-") || var.startsWith("L") || var.startsWith("param")) return false;
+        
+        // Bloquear literales de texto, caracteres y números (solo optimizar variables y temporales)
+        if (var.startsWith("\"") || var.startsWith("'") || Character.isDigit(var.charAt(0)) || (var.length() > 1 && var.charAt(0) == '-' && Character.isDigit(var.charAt(1)))) return false;
+
+        // Consultar tipo en la tabla de símbolos o temporales
+        String tipo = "desconocido";
+        Simbolo s = CompiladorGamerCode.buscarSimbolo(var);
+        if (s != null) {
+            tipo = s.tipo;
+        } else if (var.startsWith("_t")) {
+            try {
+                tipo = GeneradorCodigoIntermedio.getTipoTemporal(var);
+            } catch (Exception e) {}
+        }
+        
+        // Solo optimizar tipos numéricos (entero, decimal, booleano)
+        // Ignorar explícitamente texto y arreglos
+        return !tipo.equals("texto") && !tipo.startsWith("arreglo") && !tipo.equals("error");
+    }
+    
+    // Paso 2: Construir grafo de interferencia usando análisis de liveness
+    public static void construirGrafoInterferencia(ArrayList<Cuadrupla> cuadruplas) {
+        grafo = new GrafoInterferencia();
+        
+        // Para cada bloque básico, analizar las variables vivas en cada instrucción
+        for (BloqueBasico bloque : bloquesBasicos) {
+            // Calcular variables vivas instrucción por instrucción dentro del bloque
+            ArrayList<String> vivas = new ArrayList<String>(bloque.liveOut);
+            
+            // Procesar instrucciones en orden inverso dentro del bloque
+            for (int i = bloque.fin; i >= bloque.inicio; i--) {
+                Cuadrupla c = cuadruplas.get(i);
+                // Al procesar en reversa, las variables en vivas son liveOut[i]
+                // El resultado de la instrucción interfiere con todas las vivas en liveOut[i]
+                if (debeOptimizarse(c.resultado)) {
+                    grafo.agregarNodo(c.resultado);
+                    for (String viva : vivas) {
+                        // Evitar auto-interferencia y optimización de copias (v = w)
+                        if (!viva.equals(c.resultado) && !viva.equals(c.operando1)) {
+                            grafo.agregarArista(c.resultado, viva);
+                        }
+                    }
+                    // Ahora que procesamos la def, la variable ya no está viva ANTES de esta instrucción
+                    vivas.remove(c.resultado);
+                }
+                
+                // Agregar operandos a las vivas (están vivas ANTES de esta instrucción)
+                if (debeOptimizarse(c.operando1)) {
+                    if (!vivas.contains(c.operando1)) vivas.add(c.operando1);
+                }
+                if (debeOptimizarse(c.operando2)) {
+                    if (!vivas.contains(c.operando2)) vivas.add(c.operando2);
+                }
+            }
+        }
+    }
+    
+    // Paso 3: Asignación de registros usando coloración de grafos con heurística de spill
+    public static void asignarRegistros() {
+        asignacionRegistros = new HashMap<String, String>();
+        ArrayList<String> pila = new ArrayList<String>();
+        GrafoInterferencia grafoTemp = new GrafoInterferencia();
+        
+        // Calcular costo de spill para cada variable (basado en grado y uso)
+        HashMap<String, Integer> costoSpill = new HashMap<String, Integer>();
+        for (String var : grafo.adyacencia.keySet()) {
+            int grado = grafo.getGrado(var);
+            int costo = grado * 10; // Mayor grado = mayor costo de spill
+            costoSpill.put(var, costo);
+        }
+        
+        // Copiar el grafo
+        for (String var : grafo.adyacencia.keySet()) {
+            grafoTemp.agregarNodo(var);
+            for (String vecino : grafo.adyacencia.get(var)) {
+                grafoTemp.agregarArista(var, vecino);
+            }
+        }
+        
+        // Simplificación: remover nodos con grado < K
+        boolean cambio = true;
+        while (cambio) {
+            cambio = false;
+            ArrayList<String> vars = new ArrayList<String>(grafoTemp.adyacencia.keySet());
+            // Ordenar por grado ascendente para simplificar primero nodos fáciles
+            java.util.Collections.sort(vars, new java.util.Comparator<String>() {
+                public int compare(String a, String b) {
+                    return grafoTemp.getGrado(a) - grafoTemp.getGrado(b);
+                }
+            });
+            for (String var : vars) {
+                if (grafoTemp.getGrado(var) < NUM_REGISTROS) {
+                    pila.add(var);
+                    grafoTemp.eliminarNodo(var);
+                    cambio = true;
+                }
+            }
+        }
+        
+        // Si quedan nodos (spilling), usar heurística de costo
+        while (!grafoTemp.adyacencia.isEmpty()) {
+            // Encontrar nodo con menor costo de spill
+            String varSpill = null;
+            int minCosto = Integer.MAX_VALUE;
+            for (String var : grafoTemp.adyacencia.keySet()) {
+                int costo = costoSpill.containsKey(var) ? costoSpill.get(var) : grafoTemp.getGrado(var);
+                if (costo < minCosto) {
+                    minCosto = costo;
+                    varSpill = var;
+                }
+            }
+            if (varSpill != null) {
+                pila.add(varSpill);
+                grafoTemp.eliminarNodo(varSpill);
+            }
+        }
+        
+        // Asignar colores (registros) en orden inverso
+        while (!pila.isEmpty()) {
+            String var = pila.remove(pila.size() - 1);
+            
+            // Encontrar registro disponible
+            boolean[] registrosUsados = new boolean[NUM_REGISTROS];
+            if (grafo.adyacencia.containsKey(var)) {
+                for (String vecino : grafo.adyacencia.get(var)) {
+                    if (asignacionRegistros.containsKey(vecino)) {
+                        String reg = asignacionRegistros.get(vecino);
+                        if (reg.startsWith("R")) {
+                            int regNum = Integer.parseInt(reg.substring(1));
+                            if (regNum < NUM_REGISTROS) {
+                                registrosUsados[regNum] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Buscar registro libre
+            int registroLibre = -1;
+            for (int i = 0; i < NUM_REGISTROS; i++) {
+                if (!registrosUsados[i]) {
+                    registroLibre = i;
+                    break;
+                }
+            }
+            
+            if (registroLibre != -1) {
+                asignacionRegistros.put(var, "R" + registroLibre);
+            } else {
+                // Spill: mantener en memoria con nombre original
+                asignacionRegistros.put(var, var);
+            }
+        }
+    }
+    
+    // Paso 4: Aplicar asignación de registros a las cuadruplas
+    public static ArrayList<Cuadrupla> aplicarAsignacionRegistros(ArrayList<Cuadrupla> cuadruplas) {
+        ArrayList<Cuadrupla> optimizadas = new ArrayList<Cuadrupla>();
+        
+        for (Cuadrupla c : cuadruplas) {
+            String nuevoOp1 = c.operando1;
+            String nuevoOp2 = c.operando2;
+            String nuevoRes = c.resultado;
+            
+            if (asignacionRegistros.containsKey(c.operando1) && !c.operando1.equals("-")) {
+                nuevoOp1 = asignacionRegistros.get(c.operando1);
+            }
+            if (asignacionRegistros.containsKey(c.operando2) && !c.operando2.equals("-")) {
+                nuevoOp2 = asignacionRegistros.get(c.operando2);
+            }
+            if (asignacionRegistros.containsKey(c.resultado) && !c.resultado.equals("-")) {
+                nuevoRes = asignacionRegistros.get(c.resultado);
+            }
+            
+            Cuadrupla nueva = new Cuadrupla(c.operador, nuevoOp1, nuevoOp2, nuevoRes, c.linea);
+            optimizadas.add(nueva);
+        }
+        
+        return optimizadas;
+    }
+    
+    // Método principal de optimización
+    public static ArrayList<Cuadrupla> optimizar(ArrayList<Cuadrupla> cuadruplas) {
+        System.out.println("\n=== INICIANDO OPTIMIZACIÓN: ASIGNACIÓN DE REGISTROS GLOBAL ===");
+        
+        // Paso 1.1: Identificar bloques básicos
+        identificarBloquesBasicos(cuadruplas);
+        
+        // Paso 1.2: Construir CFG
+        construirCFG(cuadruplas);
+        
+        // Paso 1.3: Análisis de liveness (data-flow analysis)
+        analizarLiveness(cuadruplas);
+        
+        // Paso 2: Construir grafo de interferencia usando liveness
+        construirGrafoInterferencia(cuadruplas);
+        System.out.println("Grafo de interferencia construido con " + grafo.adyacencia.size() + " nodos");
+        
+        // Paso 3: Asignar registros con heurística de spill
+        asignarRegistros();
+        System.out.println("Registros asignados: " + asignacionRegistros.size());
+        
+        // Paso 4: Aplicar asignación
+        ArrayList<Cuadrupla> optimizadas = aplicarAsignacionRegistros(cuadruplas);
+        
+        // Estadísticas
+        int enRegistro = 0;
+        int enMemoria = 0;
+        for (String reg : asignacionRegistros.values()) {
+            if (reg.startsWith("R")) enRegistro++;
+            else enMemoria++;
+        }
+        System.out.println("Variables en registros: " + enRegistro);
+        System.out.println("Variables en memoria: " + enMemoria);
+        System.out.println("=== OPTIMIZACIÓN COMPLETADA ===\n");
+        
+        return optimizadas;
+    }
+    
+    // Generar archivo de código optimizado completo con todas las etapas
+    public static void escribirArchivoOptimizadoCompleto(ArrayList<Cuadrupla> original,
+                                                          ArrayList<Cuadrupla> exprOpt,
+                                                          ArrayList<Cuadrupla> regOpt,
+                                                          String nombreArchivo) {
+        try {
+            java.io.FileWriter writer = new java.io.FileWriter(nombreArchivo);
+            
+            // SECCIÓN 1: Código original (sin optimizaciones)
+            writer.write("================================================================================\n");
+            writer.write("=== SECCIÓN 1: CÓDIGO INTERMEDIO ORIGINAL (SIN OPTIMIZACIONES) ===\n");
+            writer.write("================================================================================\n\n");
+            writer.write("FORMATO: (línea) operador, operando1, operando2, resultado\n\n");
+            
+            for (Cuadrupla cuadrupla : original) {
+                writer.write(cuadrupla.toString() + "\n");
+            }
+            
+            writer.write("\n=== RESUMEN CÓDIGO ORIGINAL ===\n");
+            writer.write("Total de cuádruplas: " + original.size() + "\n\n");
+            
+            // SECCIÓN 2: Código después de optimización de expresiones
+            writer.write("================================================================================\n");
+            writer.write("=== SECCIÓN 2: CÓDIGO DESPUÉS DE OPTIMIZACIÓN DE EXPRESIONES ===\n");
+            writer.write("================================================================================\n");
+            writer.write("Optimizaciones aplicadas:\n");
+            writer.write("- Plegado de constantes (constant folding)\n");
+            writer.write("- Simplificaciones algebraicas (x+0, x*1, etc.)\n");
+            writer.write("- Eliminación de subexpresiones comunes (CSE)\n");
+            writer.write("- Propagación de copias\n\n");
+            writer.write("FORMATO: (línea) operador, operando1, operando2, resultado\n\n");
+            
+            for (Cuadrupla cuadrupla : exprOpt) {
+                writer.write(cuadrupla.toString() + "\n");
+            }
+            
+            writer.write("\n=== RESUMEN OPTIMIZACIÓN DE EXPRESIONES ===\n");
+            writer.write("Cuádruplas antes: " + original.size() + "\n");
+            writer.write("Cuádruplas después: " + exprOpt.size() + "\n");
+            writer.write("Reducción: " + (original.size() - exprOpt.size()) + " cuádruplas eliminadas\n\n");
+            
+            // SECCIÓN 3: Código final después de asignación de registros
+            writer.write("================================================================================\n");
+            writer.write("=== SECCIÓN 3: CÓDIGO FINAL DESPUÉS DE ASIGNACIÓN DE REGISTROS ===\n");
+            writer.write("================================================================================\n");
+            writer.write("Optimizaciones aplicadas:\n");
+            writer.write("- Identificación de bloques básicos\n");
+            writer.write("- Construcción de grafo de flujo de control (CFG)\n");
+            writer.write("- Análisis de liveness (data-flow analysis)\n");
+            writer.write("- Grafo de interferencia basado en liveness\n");
+            writer.write("- Coloración de grafos con heurística de spill\n\n");
+            writer.write("FORMATO: (línea) operador, operando1, operando2, resultado\n\n");
+            
+            for (Cuadrupla cuadrupla : regOpt) {
+                writer.write(cuadrupla.toString() + "\n");
+            }
+            
+            writer.write("\n=== TABLA DE ASIGNACIÓN DE REGISTROS ===\n");
+            for (Map.Entry<String, String> entry : asignacionRegistros.entrySet()) {
+                writer.write(entry.getKey() + " -> " + entry.getValue() + "\n");
+            }
+            
+            writer.write("\n=== RESUMEN ASIGNACIÓN DE REGISTROS ===\n");
+            writer.write("Total de cuádruplas finales: " + regOpt.size() + "\n");
+            int enRegistro = 0;
+            int enMemoria = 0;
+            for (String reg : asignacionRegistros.values()) {
+                if (reg.startsWith("R")) enRegistro++;
+                else enMemoria++;
+            }
+            writer.write("Variables en registros (R0-R7): " + enRegistro + "\n");
+            writer.write("Variables en memoria (spill): " + enMemoria + "\n\n");
+            
+            // RESUMEN GLOBAL
+            writer.write("================================================================================\n");
+            writer.write("=== RESUMEN GLOBAL DE OPTIMIZACIONES ===\n");
+            writer.write("================================================================================\n");
+            writer.write("Código original:           " + original.size() + " cuádruplas\n");
+            writer.write("Después de expresiones:    " + exprOpt.size() + " cuádruplas\n");
+            writer.write("Después de registros:      " + regOpt.size() + " cuádruplas\n");
+            writer.write("Reducción total:           " + (original.size() - regOpt.size()) + " cuádruplas\n");
+            writer.write("Porcentaje de reducción:   " + 
+                String.format("%.1f", 100.0 * (original.size() - regOpt.size()) / original.size()) + "%\n");
+            
+            writer.close();
+            System.out.println("Código optimizado completo generado en: " + nombreArchivo);
+        } catch (Exception e) {
+            System.err.println("Error al escribir archivo optimizado: " + e.getMessage());
+        }
+    }
+    
+    // Generar archivo de código optimizado (método obsoleto, mantener por compatibilidad)
+    public static void escribirArchivoOptimizado(ArrayList<Cuadrupla> cuadruplas, String nombreArchivo) {
+        escribirArchivoOptimizadoCompleto(cuadruplas, cuadruplas, cuadruplas, nombreArchivo);
+    }
+}
+
+// =============================================================
+// Generador de Código C — Opción B (cobertura completa)
+// Cubre: aritméticas, lógicas, saltos, I/O, math (pot/raiz),
+//        funciones de usuario, arreglos, entrada (scanf).
+// =============================================================
+class GeneradorCodigoC {
+
+    // Mapa de operadores cuádrupla → operador C
+    private static final java.util.Map<String,String> OP_C;
+    static {
+        OP_C = new HashMap<String,String>();
+        OP_C.put("SUMA","+"); OP_C.put("RESTA","-"); OP_C.put("MULT","*");
+        OP_C.put("DIV","/"); OP_C.put("DIV_ENT","/"); OP_C.put("MOD","%");
+        OP_C.put("+","+"); OP_C.put("-","-"); // Soporte para operadores directos
+        OP_C.put("GT",">"); OP_C.put("LT","<"); OP_C.put("GE",">=");
+        OP_C.put("LE","<="); OP_C.put("EQ","=="); OP_C.put("NE","!=");
+        OP_C.put("AND","&&"); OP_C.put("OR","||");
+    }
+    private static final java.util.Set<String> OPS_CMP = new java.util.HashSet<String>(
+        java.util.Arrays.asList("GT","LT","GE","LE","EQ","NE","AND","OR"));
+
+    // Estado para acumular PARAM antes de un CALL y para funciones
+    private static java.util.LinkedHashMap<String,String> paramsAcumulados =
+        new java.util.LinkedHashMap<String,String>();
+    // Firma de funciones de usuario: nombre -> lista de param vars (en orden)
+    private static java.util.LinkedHashMap<String, java.util.List<String>> firmaFunciones =
+        new java.util.LinkedHashMap<String, java.util.List<String>>();
+    // Contexto actual de función (para BEGIN_FUNC/END_FUNC)
+    private static String funcionActual = null;
+
+    // --- Primer pase: descubrir firmas de funciones (params por BEGIN_FUNC/PARAMs previos) ---
+    private static void descubrirFirmas(ArrayList<Cuadrupla> cuadruplas) {
+        firmaFunciones.clear();
+        String fnActual = null;
+        java.util.List<String> paramsActuales = null;
+        for (int i = 0; i < cuadruplas.size(); i++) {
+            Cuadrupla c = cuadruplas.get(i);
+            if (c.operador.equals("BEGIN_FUNC")) {
+                fnActual = c.operando1;
+                paramsActuales = new java.util.ArrayList<String>();
+                firmaFunciones.put(fnActual, paramsActuales);
+            } else if (c.operador.equals("END_FUNC")) {
+                fnActual = null; paramsActuales = null;
+            } else if (c.operador.equals("=") && fnActual != null && paramsActuales != null) {
+                // Los primeros "= paramN , - , varLocal" dentro del BEGIN_FUNC son parámetros
+                if (c.operando1 != null && c.operando1.startsWith("param")) {
+                    paramsActuales.add(c.resultado);
+                }
+            }
+        }
+    }
+
+    public static void generar(ArrayList<Cuadrupla> cuadruplas, String nombreArchivo) {
+        try {
+            descubrirFirmas(cuadruplas);
+            paramsAcumulados.clear();
+            funcionActual = null;
+
+            java.io.PrintWriter pw = new java.io.PrintWriter(
+                new java.io.OutputStreamWriter(
+                    new java.io.FileOutputStream(nombreArchivo), "UTF-8"));
+
+            // Recolectar literales texto
+            ArrayList<String> lits = new ArrayList<String>();
+            for (Cuadrupla c : cuadruplas) {
+                recolectarLiteral(c.operando1, lits);
+                recolectarLiteral(c.operando2, lits);
+                recolectarLiteral(c.resultado, lits);
+            }
+
+            // Cabecera
+            pw.println("/* Código C — CompiladorGamerCode (Opción B) */");
+            pw.println("#include <stdio.h>");
+            pw.println("#include <string.h>");
+            pw.println("#include <math.h>");
+            pw.println("#include <stdlib.h>");
+            pw.println();
+
+            // Literales texto globales
+            if (!lits.isEmpty()) {
+                for (int i = 0; i < lits.size(); i++)
+                    pw.println("static const char* _str" + i + " = " + lits.get(i) + ";");
+                pw.println();
+            }
+
+            // Prototipos de funciones de usuario
+            for (String fn : firmaFunciones.keySet()) {
+                java.util.List<String> params = firmaFunciones.get(fn);
+                StringBuilder proto = new StringBuilder("double ").append(fn).append("(");
+                for (int i = 0; i < params.size(); i++) {
+                    if (i > 0) proto.append(", ");
+                    proto.append("double ").append(params.get(i));
+                }
+                proto.append(");");
+                pw.println(proto.toString());
+            }
+            if (!firmaFunciones.isEmpty()) pw.println();
+
+            // Variables globales de main (vars fuera de funciones)
+            java.util.LinkedHashSet<String> varsMain = recolectarVarsBloque(cuadruplas, false, lits);
+            // Arreglos declarados
+            java.util.LinkedHashMap<String,String> arreglos = recolectarArreglos(cuadruplas);
+
+            // Cuerpo principal
+            pw.println("int main() {");
+            
+            // Separar variables por tipo
+            java.util.LinkedHashSet<String> varsEscalares = new java.util.LinkedHashSet<String>();
+            java.util.LinkedHashSet<String> varsTexto = new java.util.LinkedHashSet<String>();
+            
+            for (String v : varsMain) {
+                if (arreglos.containsKey(v)) continue; // Evitar duplicar arreglos
+                
+                Simbolo s = CompiladorGamerCode.buscarSimbolo(v);
+                if (s != null && s.tipo.equals("texto")) {
+                    varsTexto.add(v);
+                } else if (v.startsWith("R") && v.length() <= 3) {
+                    varsEscalares.add(v); // Registros siempre double
+                } else if (v.startsWith("_t")) {
+                    varsEscalares.add(v); // Temporales siempre double
+                } else {
+                    varsEscalares.add(v);
+                }
+            }
+
+            if (!varsEscalares.isEmpty()) {
+                pw.print("    double");
+                boolean first = true;
+                for (String v : varsEscalares) {
+                    pw.print(first ? " " : ", "); pw.print(v + " = 0"); first = false;
+                }
+                pw.println(";");
+            }
+            
+            if (!varsTexto.isEmpty()) {
+                pw.print("    const char*");
+                boolean first = true;
+                for (String v : varsTexto) {
+                    pw.print(first ? " " : ", "); pw.print(v); first = false;
+                }
+                pw.println(" = NULL;");
+            }
+
+            for (Map.Entry<String,String> e : arreglos.entrySet()) {
+                pw.println("    double " + e.getKey() + "[256] = {0};");
+                pw.println("    int _len_" + e.getKey() + " = 0;");
+            }
+            if (!varsEscalares.isEmpty() || !varsTexto.isEmpty() || !arreglos.isEmpty()) pw.println();
+
+            // Traducir instrucciones del bloque main (fuera de funciones)
+            String sangria = "    ";
+            for (Cuadrupla c : cuadruplas) {
+                if (c.operador.equals("BEGIN_FUNC")) { break; } // funciones van aparte
+                String linea = traducirCuadrupla(c, lits, arreglos, sangria);
+                if (linea != null) pw.println(linea);
+            }
+            pw.println();
+            pw.println("    return 0;");
+            pw.println("}");
+
+            // Definiciones de funciones de usuario
+            if (!firmaFunciones.isEmpty()) {
+                pw.println();
+                boolean dentroFuncion = false;
+                java.util.LinkedHashSet<String> varsFn = null;
+                java.util.LinkedHashMap<String,String> arrFn = null;
+                java.util.List<Cuadrupla> bloqueFunc = null;
+                String fnActual2 = null;
+
+                for (int i = 0; i < cuadruplas.size(); i++) {
+                    Cuadrupla c = cuadruplas.get(i);
+                    if (c.operador.equals("BEGIN_FUNC")) {
+                        dentroFuncion = true;
+                        fnActual2 = c.operando1;
+                        bloqueFunc = new java.util.ArrayList<Cuadrupla>();
+                        // Recolectar cuádruplas de esta función
+                        for (int j = i+1; j < cuadruplas.size(); j++) {
+                            if (cuadruplas.get(j).operador.equals("END_FUNC")) { i = j; break; }
+                            bloqueFunc.add(cuadruplas.get(j));
+                        }
+                        java.util.List<String> paramsFn = firmaFunciones.get(fnActual2);
+                        StringBuilder def = new StringBuilder("double ").append(fnActual2).append("(");
+                        for (int k = 0; k < paramsFn.size(); k++) {
+                            if (k > 0) def.append(", ");
+                            def.append("double ").append(paramsFn.get(k));
+                        }
+                        def.append(") {");
+                        pw.println(def.toString());
+                        varsFn = recolectarVarsBloque(bloqueFunc, true, lits);
+                        arrFn = recolectarArreglos(bloqueFunc); // Inicializar arrFn
+                        
+                        java.util.LinkedHashSet<String> varsFnEscalares = new java.util.LinkedHashSet<String>();
+                        java.util.LinkedHashSet<String> varsFnTexto = new java.util.LinkedHashSet<String>();
+                        
+                        for (String v : varsFn) {
+                            if (paramsFn.contains(v)) continue;
+                            if (arrFn.containsKey(v)) continue;
+                            
+                            Simbolo s = CompiladorGamerCode.buscarSimbolo(v);
+                            if (s != null && s.tipo.equals("texto")) {
+                                varsFnTexto.add(v);
+                            } else {
+                                varsFnEscalares.add(v);
+                            }
+                        }
+
+                        if (!varsFnEscalares.isEmpty()) {
+                            pw.print("    double");
+                            boolean first2 = true;
+                            for (String v : varsFnEscalares) { pw.print(first2 ? " " : ", "); pw.print(v + " = 0"); first2 = false; }
+                            pw.println(";");
+                        }
+                        
+                        if (!varsFnTexto.isEmpty()) {
+                            pw.print("    const char*");
+                            boolean first2 = true;
+                            for (String v : varsFnTexto) { pw.print(first2 ? " " : ", "); pw.print(v); first2 = false; }
+                            pw.println(" = NULL;");
+                        }
+
+                        for (Map.Entry<String,String> e : arrFn.entrySet()) {
+                            pw.println("    double " + e.getKey() + "[256] = {0};");
+                            pw.println("    int _len_" + e.getKey() + " = 0;");
+                        }
+                        for (Cuadrupla cb : bloqueFunc) {
+                            String lb = traducirCuadrupla(cb, lits, arrFn, sangria);
+                            if (lb != null) pw.println(lb);
+                        }
+                        pw.println("    return 0;");
+                        pw.println("}");
+                        pw.println();
+                    }
+                }
+            }
+
+            pw.flush(); pw.close();
+            System.out.println("Código C generado en: " + nombreArchivo);
+        } catch (Exception e) {
+            System.err.println("Error al generar código C: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void recolectarLiteral(String s, ArrayList<String> lista) {
+        if (s == null || s.equals("-") || s.isEmpty()) return;
+        String op = s.trim();
+        if (op.length() >= 2 && op.charAt(0) == '"' && op.charAt(op.length()-1) == '"')
+            if (!lista.contains(op)) lista.add(op);
+    }
+
+    private static java.util.LinkedHashSet<String> recolectarVarsBloque(
+            java.util.List<Cuadrupla> cuads, boolean esFuncion, ArrayList<String> lits) {
+        java.util.LinkedHashSet<String> vars = new java.util.LinkedHashSet<String>();
+        for (Cuadrupla c : cuads) {
+            recolectarVar(c.operando1, vars, lits);
+            recolectarVar(c.operando2, vars, lits);
+            recolectarVar(c.resultado,  vars, lits);
+        }
+        return vars;
+    }
+
+    private static java.util.LinkedHashMap<String,String> recolectarArreglos(
+            java.util.List<Cuadrupla> cuads) {
+        java.util.LinkedHashMap<String,String> arr = new java.util.LinkedHashMap<String,String>();
+        for (Cuadrupla c : cuads)
+            if (c.operador.equals("CREATE_ARRAY") && c.resultado != null && !c.resultado.equals("-"))
+                arr.put(c.resultado, c.operando1);
+        return arr;
+    }
+
+    private static void recolectarVar(String s, java.util.LinkedHashSet<String> vars,
+                                      ArrayList<String> lits) {
+        if (s == null || s.equals("-") || s.isEmpty()) return;
+        String op = s.trim();
+        if (esLiteral(op)) return;
+        if (op.matches("L\\d+")) return;              // etiquetas
+        if (op.startsWith("FUNC_")) return;           // etiquetas de función
+        if (op.startsWith("END_FUNC_")) return;
+        if (op.startsWith("param")) return;           // param1, param2... son args de CALL
+        vars.add(op);
+    }
+
+    private static boolean esLiteral(String s) {
+        if (s == null || s.isEmpty()) return true;
+        if (s.equals("verdadero") || s.equals("falso")) return true;
+        if (s.startsWith("\"") || s.startsWith("'")) return true;
+        try { Double.parseDouble(s); return true; } catch (NumberFormatException e2) {}
+        return false;
+    }
+
+    /** Traducción de una cuádrupla a sentencia C. */
+    private static String traducirCuadrupla(Cuadrupla c, ArrayList<String> lits,
+            java.util.LinkedHashMap<String,String> arreglos, String sg) {
+        String op = c.operador, op1 = c.operando1, op2 = c.operando2, res = c.resultado;
+
+        switch (op) {
+
+            case "=":
+                if (res == null || res.equals("-")) return null;
+                if (op1 != null && op1.startsWith("param")) return null; // copia de param, ya está en firma
+                return sg + res + " = " + resOp(op1, lits) + ";";
+
+            case "SUMA": case "RESTA": case "MULT": case "DIV": case "DIV_ENT": case "MOD":
+            case "+": case "-": case "*": case "/": {
+                String opc = OP_C.get(op);
+                if (opc == null) opc = op; // fallback
+                return sg + res + " = " + resOp(op1,lits) + " " + opc + " " + resOp(op2,lits) + ";";
+            }
+
+            case "GT": case "LT": case "GE": case "LE": case "EQ": case "NE":
+            case "AND": case "OR":
+                return sg + res + " = (" + resOp(op1,lits) + " " + OP_C.get(op) + " " + resOp(op2,lits) + ") ? 1 : 0;";
+
+            case "NEG":
+                return sg + res + " = -" + resOp(op1,lits) + ";";
+
+            case "NOT":
+                return sg + res + " = !" + resOp(op1,lits) + ";";
+
+            case "LABEL":
+                if (res == null || res.equals("-")) return null;
+                // Etiquetas de función se omiten (ya son nombres de función en C)
+                if (res.startsWith("FUNC_") || res.startsWith("END_FUNC_")) return null;
+                return res + ":;";
+
+            case "GOTO":
+                if (res != null && (res.startsWith("FUNC_") || res.startsWith("END_FUNC_"))) return null;
+                return sg + "goto " + res + ";";
+
+            case "IF_FALSE":
+                return sg + "if (!" + resOp(op1,lits) + ") goto " + res + ";";
+
+            case "IF_TRUE":
+                return sg + "if (" + resOp(op1,lits) + ") goto " + res + ";";
+
+            case "PRINT": case "IMPSL": case "IMP_SL":
+                return sg + generarPrintf(op1, lits, false);
+            
+            case "PRINTLN": case "IMP":
+                return sg + generarPrintf(op1, lits, true);
+
+            case "INPUT": {
+                // res recibe el valor leído
+                if (res == null || res.equals("-")) return sg + "scanf(\"%lf\", &_tmp_input);";
+                return sg + "scanf(\"%lf\", &" + res + ");";
+            }
+
+            case "INC": {
+                String target = (op1 != null && !op1.equals("-")) ? op1 : res;
+                return sg + target + " = " + target + " + 1;";
+            }
+            case "DEC": {
+                String target = (op1 != null && !op1.equals("-")) ? op1 : res;
+                return sg + target + " = " + target + " - 1;";
+            }
+
+            case "RETURN": case "REGRESA":
+                if (op1 != null && !op1.equals("-"))
+                    return sg + "return " + resOp(op1,lits) + ";";
+                return sg + "return 0;";
+
+            // Funciones matemáticas
+            case "POT2":
+                return sg + res + " = pow(" + resOp(op1,lits) + ", 2);";
+            case "POT":
+                return sg + res + " = pow(" + resOp(op1,lits) + ", " + resOp(op2,lits) + ");";
+            case "RAIZ2":
+                return sg + res + " = sqrt(" + resOp(op1,lits) + ");";
+            case "RAIZ":
+                // raiz(radicando, indice) → pow(rad, 1.0/indice)
+                return sg + res + " = pow(" + resOp(op1,lits) + ", 1.0/(" + resOp(op2,lits) + "));";
+
+            // Arreglos
+            case "CREATE_ARRAY":
+                // Solo marca creación; la declaración ya fue emitida en el preámbulo
+                return sg + "/* arreglo '" + res + "' declarado */";
+
+            case "ACCESS":
+                // res = op1[op2]
+                return sg + res + " = " + op1 + "[(int)" + resOp(op2, lits) + "];";
+
+            case "ASSIGN_ARRAY":
+                // op1[op2] = res
+                return sg + op1 + "[(int)" + resOp(op2, lits) + "] = " + resOp(res, lits) + ";";
+
+            case "LENGTH": {
+                // Si op1 es un literal string, usar strlen; si es arreglo usar _len_var
+                String v = op1 != null ? op1.trim() : "-";
+                if (v.startsWith("\"")) {
+                    int idx = lits.indexOf(v);
+                    String ref = idx >= 0 ? "_str" + idx : v;
+                    return sg + res + " = strlen(" + ref + ");";
+                }
+                return sg + res + " = _len_" + v + ";";
+            }
+
+            // Llamadas a funciones de usuario
+            case "ERA":
+                paramsAcumulados.clear();
+                return null; // solo limpia el acumulador de params
+
+            case "PARAM": {
+                // PARAM , valor , - , paramN
+                String paramKey = res;  // param1, param2, ...
+                paramsAcumulados.put(paramKey, resOp(op1, lits));
+                return null;
+            }
+
+            case "CALL": {
+                // CALL , nombreFuncion , - , temporal
+                String fnNombre = op1;
+                StringBuilder sb = new StringBuilder();
+                if (res != null && !res.equals("-"))
+                    sb.append(sg).append(res).append(" = ");
+                else
+                    sb.append(sg);
+                sb.append(fnNombre).append("(");
+                // Ordenar parámetros por índice (param1, param2, ...)
+                java.util.List<String> keys = new java.util.ArrayList<String>(paramsAcumulados.keySet());
+                java.util.Collections.sort(keys);
+                boolean first = true;
+                for (String k : keys) {
+                    if (!first) sb.append(", ");
+                    sb.append(paramsAcumulados.get(k));
+                    first = false;
+                }
+                sb.append(");");
+                paramsAcumulados.clear();
+                return sb.toString();
+            }
+
+            // Delimitadores de función — ya manejados en el bucle de generar()
+            case "BEGIN_FUNC": case "END_FUNC":
+                return null;
+
+            default:
+                return sg + "/* [no mapeado] " + c.operador + " */";
+        }
+    }
+
+    private static String generarPrintf(String operando, ArrayList<String> lits, boolean nl) {
+        if (operando == null || operando.equals("-")) return "printf(\"\\n\");";
+        String op = operando.trim();
+        String newline = nl ? "\\n" : "";
+        
+        // 1. Literal de cadena directo
+        if (op.startsWith("\"")) {
+            int idx = lits.indexOf(op);
+            return "printf(\"%s" + newline + "\", " + (idx >= 0 ? "_str" + idx : op) + ");";
+        }
+        
+        // 2. Literal de carácter directo
+        if (op.startsWith("'")) return "printf(\"%c" + newline + "\", " + op + ");";
+        
+        // 3. Determinar tipo (texto vs número)
+        boolean esTexto = false;
+        
+        // Revisar si es una variable de usuario
+        Simbolo sim = CompiladorGamerCode.buscarSimbolo(op);
+        if (sim != null && sim.tipo.equals("texto")) {
+            esTexto = true;
+        } 
+        // Revisar si es un temporal (_t1, _t2...)
+        else if (op.startsWith("_t")) {
+            try {
+                String tipo = GeneradorCodigoIntermedio.getTipoTemporal(op);
+                if ("texto".equals(tipo)) esTexto = true;
+            } catch (Exception e) {}
+        }
+        // Revisar si es un registro (R0-R7) buscando qué variable tiene asignada
+        else if (op.startsWith("R") && op.length() <= 3) {
+            // Buscar en el mapa de asignación de registros de forma inversa
+            for (java.util.Map.Entry<String, String> entry : OptimizadorRegistros.asignacionRegistros.entrySet()) {
+                if (entry.getValue().equals(op)) {
+                    String varOriginal = entry.getKey();
+                    Simbolo sOrig = CompiladorGamerCode.buscarSimbolo(varOriginal);
+                    if (sOrig != null && sOrig.tipo.equals("texto")) {
+                        esTexto = true;
+                        break;
+                    }
+                    if (varOriginal.startsWith("_t")) {
+                        try {
+                            if ("texto".equals(GeneradorCodigoIntermedio.getTipoTemporal(varOriginal))) {
+                                esTexto = true;
+                                break;
+                            }
+                        } catch (Exception e) {}
+                    }
+                }
+            }
+        }
+
+        if (esTexto) {
+            return "printf(\"%s" + newline + "\", " + op + ");";
+        } else {
+            // Asegurar que si es un número, se imprima con %g
+            return "printf(\"%.0f\\n" + newline + "\", (double)" + op + ");";
+        }
+    }
+
+    private static String resOp(String s, ArrayList<String> lits) {
+        if (s == null || s.equals("-")) return "0";
+        String op = s.trim();
+        if (op.equals("verdadero")) return "1";
+        if (op.equals("falso")) return "0";
+        if (op.startsWith("\"")) {
+            int idx = lits.indexOf(op);
+            return idx >= 0 ? "_str" + idx : op;
+        }
+        return op;
+    }
+
+    public static void compilar(String archivoC, String archivoExe) {
+        System.out.println("\n=== PASO 3b: COMPILANDO CON GCC ===");
+        System.out.println("Comando: gcc " + archivoC + " -o " + archivoExe + " -lm");
+        try {
+            ProcessBuilder pb = new ProcessBuilder("gcc", archivoC, "-o", archivoExe, "-lm");
+            pb.redirectErrorStream(true);
+            Process proceso = pb.start();
+            java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(proceso.getInputStream(), "UTF-8"));
+            String linea; StringBuilder out = new StringBuilder();
+            while ((linea = reader.readLine()) != null) out.append(linea).append("\n");
+            int exit = proceso.waitFor();
+            if (exit == 0) {
+                System.out.println("Ejecutable generado exitosamente: " + archivoExe);
+            } else {
+                System.err.println("gcc terminó con errores (código " + exit + "):");
+                System.err.println(out.toString());
+            }
+        } catch (java.io.IOException e) {
+            System.err.println("[AVISO] gcc no encontrado en PATH. Archivo C listo en: " + archivoC);
+            System.err.println("Compilar manualmente: gcc " + archivoC + " -o " + archivoExe + " -lm");
+        } catch (InterruptedException e) {
+            System.err.println("gcc interrumpido: " + e.getMessage());
+        }
+    }
+}
+
+PARSER_END(CompiladorGamerCode)
+
+
+
+
+// =============================================================
+// TOKENS
+// =============================================================
+
+// Tokens ignorados
+SKIP : {
+    <ESPACIO: " " | "\t" | "\r" | "\n"> |
+    <COMENTARIO: "#" (~["\n", "\r"])* >
+}
+
+// Palabras reservadas
+TOKEN : { <INICIO:   "inicio"> }
+TOKEN : { <FIN:      "fin"> }
+TOKEN : { <FUNCION:  "fun"> }
+TOKEN : { <REGRESA:  "regresa"> }
+TOKEN : { <CERRAR:   "cerrar"> }
+
+// Tipos de datos
+TOKEN : { <TIPO_ENTERO: "entero"> }
+TOKEN : { <TIPO_DECIMAL: "decimal"> }
+TOKEN : { <TIPO_TEXTO: "texto"> }
+TOKEN : { <TIPO_CARACTER: "caracter"> }
+TOKEN : { <TIPO_BOOLEANO: "booleano"> }
+
+// Condicionales y ciclos
+TOKEN : { <SI: "si"> }
+TOKEN : { <SI_NO: "si_no"> }
+TOKEN : { <MIENTRAS: "mientras"> }
+TOKEN : { <HACER: "hacer"> }
+TOKEN : { <SEGUN: "segun"> }
+TOKEN : { <CASO: "caso"> }
+TOKEN : { <POR_DEFECTO: "por_defecto"> }
+TOKEN : { <PARA: "para"> }
+
+// Entrada y salida
+TOKEN : { <IMP: "imp"> }
+TOKEN : { <IMPSL: "impsl"> }
+TOKEN : { <ENTRADA: "leer"> }
+
+// Operadores
+TOKEN : { <INCREMENTO: "++"> }
+TOKEN : { <DECREMENTO: "--"> }
+TOKEN : { <DIVISION_ENTERA: "//"> }
+TOKEN : { <DIVISION_DECIMAL: "/"> }
+TOKEN : { <POT2: "pot2"> }
+TOKEN : { <POT: "pot"> }
+TOKEN : { <RAIZ2: "raiz2"> }
+TOKEN : { <RAIZ: "raiz"> }
+TOKEN : { <MULTIPLICACION: "*"> }
+TOKEN : { <MODULO: "%"> }
+TOKEN : { <SUMA: "+"> }
+TOKEN : { <RESTA: "-"> }
+
+TOKEN : { <MENOR_IGUAL: "<="> }
+TOKEN : { <MENOR: "<"> }
+TOKEN : { <MAYOR_IGUAL: ">="> }
+TOKEN : { <MAYOR: ">"> }
+TOKEN : { <IGUAL_COMPARACION: "=="> }
+TOKEN : { <IGUAL_ASIGNACION: "="> }
+TOKEN : { <DIFERENTE: "!="> }
+
+TOKEN : { <Y_LOGICO: "&&"> }
+TOKEN : { <O_LOGICO: "||"> }
+TOKEN : { <NO_LOGICO: "!"> }
+
+// Booleanos
+TOKEN : { <BOOLEANO: "verdadero" | "falso"> }
+
+// Delimitadores
+TOKEN : { <LLAVE_ABRE: "{"> }
+TOKEN : { <LLAVE_CIERRA: "}"> }
+TOKEN : { <PARENTESIS_ABRE: "("> }
+TOKEN : { <PARENTESIS_CIERRA: ")"> }
+TOKEN : { <CORCHETE_ABRE: "["> }
+TOKEN : { <CORCHETE_CIERRA: "]"> }
+TOKEN : { <DELIMITADOR_CASO: ":"> }
+TOKEN : { <DELIMITADOR_LINEA: ";"> }
+TOKEN : { <COMA: ","> }
+
+// Literales
+TOKEN : { <ENTERO: (["0"-"9"])+> }
+TOKEN : { <DECIMAL: (["0"-"9"])+ "." (["0"-"9"])+> }
+TOKEN : { < CARACTER: "'" (~["'", "\\", "\n", "\r"]) "'" > }
+TOKEN : { <TEXTO: "\"" ( "\\\\" | "\\\"" | "\\n" | "\\t" | ~["\"","\\","\n"] )+ "\""> }
+
+// Arreglos
+TOKEN : { <ARREGLO: "arreglo"> }
+TOKEN : { <LONGITUD: "longitud"> }
+
+// Identificadores
+TOKEN : { <CONSTANTE: "const_" (["a"-"z","A"-"Z"]) (["a"-"z","A"-"Z","0"-"9","_"])*> }
+TOKEN : { <VARIABLE: (["a"-"z","A"-"Z"]) (["a"-"z","A"-"Z","0"-"9","_"])*> }
+
+//Errores Léxicos
+// =============================================================
+// Manejo de errores léxicos
+// =============================================================
+
+// Helper para reportar errores léxicos
+TOKEN_MGR_DECLS : {
+  public static void reportarErrorLexico(String mensaje) {
+    CompiladorGamerCode.erroresLexicos++;
+    String mensajeConRecuperacion = mensaje + getSugerenciaRecuperacionLexica(mensaje);
+    CompiladorGamerCode.tabla.add(mensajeConRecuperacion);
+  }
+  
+  public static String getSugerenciaRecuperacionLexica(String mensaje) {
+    if (mensaje.contains("carácter no cerrado")) {
+      return ". Recuperación: Cierre el carácter con comillas simples (').";
+    } else if (mensaje.contains("texto no cerrado")) {
+      return ". Recuperación: Cierre el texto con comillas dobles (\"\".";
+    } else if (mensaje.contains("número decimal mal formado")) {
+      return ". Recuperación: Use el formato correcto: número.puntoDecimal (ej: 3.14).";
+    } else if (mensaje.contains("número decimal incompleto")) {
+      return ". Recuperación: Agregue dígitos después del punto decimal (ej: 3.0).";
+    } else if (mensaje.contains("identificador inválido")) {
+      return ". Recuperación: Los identificadores deben comenzar con una letra (a-z, A-Z).";
+    } else if (mensaje.contains("carácter mal formado")) {
+      return ". Recuperación: Un carácter debe contener exactamente un símbolo entre comillas simples.";
+    } else if (mensaje.contains("token no reconocido")) {
+      return ". Recuperación: Verifique que el símbolo sea válido o elimínelo si es un error.";
+    } else {
+      return ". Recuperación: Revise la sintaxis del token actual.";
+    }
+  }
+}
+
+// Error: carácter no cerrado correctamente
+SPECIAL_TOKEN : {
+  <CARACTER_MAL_CERRADO:
+      "'" (~["'", "\\", "\n", "\r"])*("\r\n" | "\n" | "\r" )
+  > {
+    reportarErrorLexico(
+      "Error léxico en línea " + input_stream.getEndLine()
+      + ", columna " + input_stream.getEndColumn()
+      + ": carácter no cerrado '" + image + "'"
+    );
+  }
+}
+
+// Error: texto sin comillas de cierre
+SPECIAL_TOKEN : {
+  <TEXTO_MAL_CERRADO:
+      "\"" ( "\\\\" | "\\\"" | "\\n" | "\\t" | "\r" | ~["\"","\\","\n","\r"] )*
+  > {
+    reportarErrorLexico(
+      "Error léxico en línea " + input_stream.getEndLine()
+      + ", columna " + input_stream.getEndColumn()
+      + ": texto no cerrado \"" + image + "\""
+    );
+  }
+}
+
+// Error: número decimal mal formado (varios puntos)
+SPECIAL_TOKEN : {
+  <DECIMAL_MAL_FORMADO:
+      (["0"-"9"])+ "." (["0"-"9"])* "." (["0"-"9"])*
+  > {
+    reportarErrorLexico(
+      "Error léxico en línea " + input_stream.getEndLine()
+      + ", columna " + input_stream.getEndColumn()
+      + ": número decimal mal formado '" + image + "'. Formato correcto: X.Y"
+    );
+  }
+}
+
+// Error: decimal con punto pero sin parte decimal
+SPECIAL_TOKEN : {
+  <DECIMAL_INCOMPLETO:
+      (["0"-"9"])+ "."
+  > {
+    reportarErrorLexico(
+      "Error léxico en línea " + input_stream.getEndLine()
+      + ", columna " + input_stream.getEndColumn()
+      + ": número decimal incompleto '" + image + "'. Formato correcto: X.Y"
+    );
+  }
+}
+
+// Error: identificador que comienza con dígito
+SPECIAL_TOKEN : {
+  <VARIABLE_INCORRECTA:
+      (["0"-"9"]) (["a"-"z","A"-"Z","0"-"9","_"])*
+  > {
+    reportarErrorLexico(
+      "Error léxico en línea " + input_stream.getEndLine()
+      + ", columna " + input_stream.getEndColumn()
+      + ": identificador inválido '" + image + "'. Debe comenzar con letra."
+    );
+  }
+}
+
+// Error: carácter mal formado (más de un símbolo entre comillas)
+SPECIAL_TOKEN : {
+  <CARACTER_MAL_FORMADO:
+      "'" (~["'", "\\", "\r", "\n"]){2,} "'"
+  > {
+    reportarErrorLexico(
+      "Error léxico en línea " + input_stream.getEndLine()
+      + ", columna " + input_stream.getEndColumn()
+      + ": carácter mal formado '" + image + "'. Debe contener un solo carácter."
+    );
+  }
+}
+
+// Error genérico: token no reconocido
+SPECIAL_TOKEN : {
+  <ERROR_LEXICO: ~[] > {
+    reportarErrorLexico(
+      "Error léxico en línea " + input_stream.getEndLine()
+      + ", columna " + input_stream.getEndColumn()
+      + ": token no reconocido '" + image + "'"
+    );
+  }
+}
+
+// =============================================================
+// SINTAXIS (GRAMATICA)
+// =============================================================
+
+void Programa() :
+{}
+{
+  <INICIO>
+  
+  // Mientras no veamos el FIN, intentamos instrucción a instrucción:
+  (
+    try {
+      Instruccion()
+    } catch (ParseException e) {
+      erroresSintacticos++;
+      tabla.add(traducirMensaje(e.getMessage()));
+      // sincronizar al siguiente delimitador
+      saltar_hasta(DELIMITADOR_LINEA, LLAVE_CIERRA, FIN);
+    }
+  )*
+  
+  <FIN>
+}
+
+// ===============================================
+// SENTENCIAS
+// ===============================================
+
+void Instruccion() :
+{}
+{
+    // LOOKAHEAD local: mira tipo + nombre + "=" + "arreglo" para distinguir
+    // DeclaracionArreglo de Declaracion antes de comprometerse con una rama
+    LOOKAHEAD( (  <TIPO_ENTERO> | <TIPO_DECIMAL> | <TIPO_TEXTO>
+                | <TIPO_CARACTER> | <TIPO_BOOLEANO> )
+               <VARIABLE> <IGUAL_ASIGNACION> <ARREGLO> )
+    DeclaracionArreglo() |
+    Declaracion() |
+    Entrada() |
+    EntradaSinParametros() |
+    Asignacion() |
+    OperacionIncrementoDecremento() |
+    Impresion() |
+    InstruccionRegresa() |
+    CondicionalSi() |
+    CondicionalSegun() |
+    CicloMientras() |
+    CicloHacerMientras() |
+    CicloPara() |
+    Funcion() |
+    LlamadaFuncionStmt() |
+    <CERRAR> <DELIMITADOR_LINEA> |
+    <DELIMITADOR_LINEA>
+}
+
+void Declaracion() :
+{ Token t, tipoToken; String tipoDato, tipoExpresion, temporalExpresion; boolean esConstante = false; Simbolo simbolo; }
+{
+    // Primero el tipo de dato
+    (
+        tipoToken=<TIPO_ENTERO> { tipoDato = "entero"; } |
+        tipoToken=<TIPO_DECIMAL> { tipoDato = "decimal"; } |
+        tipoToken=<TIPO_TEXTO> { tipoDato = "texto"; } |
+        tipoToken=<TIPO_CARACTER> { tipoDato = "caracter"; } |
+        tipoToken=<TIPO_BOOLEANO> { tipoDato = "booleano"; }
+    )
+    
+    // Luego el nombre de variable o constante
+    (t=<VARIABLE> | t=<CONSTANTE>) 
+    {
+        esConstante = t.kind == CONSTANTE;
+        simbolo = buscarSimbolo(t.image);
+        
+        if (simbolo != null) {
+            // La variable ya existe - error de declaración duplicada
+            reportarErrorSemantico("Declaración duplicada. La variable '" + t.image + "' ya existe", t);
+        }
+    }
+    <IGUAL_ASIGNACION> 
+    temporalExpresion = Expresion() 
+    {
+        tipoExpresion = obtenerTipoExpresion(temporalExpresion);
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            // Siempre registrar la variable con el tipo declarado para evitar
+            // cascada de errores "Variable no declarada" en líneas siguientes
+            String categoria = esConstante ? "constante" : "variable";
+            agregarSimbolo(t.image, tipoDato, categoria, esConstante);
+            // Verificar compatibilidad entre tipo declarado y tipo de expresión
+            if (!compatibles(tipoDato, tipoExpresion)) {
+                reportarErrorSemantico("Tipos incompatibles. Variable '" + t.image +
+                    "' declarada como " + tipoDato +
+                    " pero se asigna " + tipoExpresion, t);
+            } else {
+                // Generar cuadrupla de asignación solo si los tipos son compatibles
+                GeneradorCodigoIntermedio.agregarCuadrupla("=", temporalExpresion, "-", t.image);
+            }
+        }
+    }
+    <DELIMITADOR_LINEA>
+}
+
+
+void Asignacion() :
+{ Token t; Simbolo simbolo; String tipoExpresion, temporalExpresion; String temporalIndice = null; }
+{
+    t=<VARIABLE> ( "[" temporalIndice = Expresion() "]" )?
+    {
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Variable no declarada '" + t.image + "'", t);
+        } else if (simbolo.esConstante) {
+            reportarErrorSemantico("Intento de reasignar valor a la constante '" + t.image + "'", t);
+        }
+    }
+    <IGUAL_ASIGNACION>
+    temporalExpresion = Expresion()
+    {
+        tipoExpresion = obtenerTipoExpresion(temporalExpresion);
+        if (simbolo != null && !simbolo.esConstante) {
+            // Verificar compatibilidad (si es arreglo, el tipo de símbolo es arreglo_tipo)
+            String tipoDestino = simbolo.tipo;
+            if (tipoDestino.startsWith("arreglo_")) tipoDestino = tipoDestino.replace("arreglo_", "");
+
+            if (!compatibles(tipoDestino, tipoExpresion)) {
+                reportarErrorSemantico("Tipos incompatibles. '" + t.image +
+                    "' espera " + tipoDestino + " pero se asigna " + tipoExpresion, t);
+            } else {
+                if (temporalIndice != null) {
+                    GeneradorCodigoIntermedio.agregarCuadrupla("ASSIGN_ARRAY", t.image, temporalIndice, temporalExpresion);
+                } else {
+                    GeneradorCodigoIntermedio.agregarCuadrupla("=", temporalExpresion, "-", t.image);
+                }
+            }
+        }
+    }
+    <DELIMITADOR_LINEA>
+}
+
+void AsignacionSimple() :
+{}
+{
+    <VARIABLE> <IGUAL_ASIGNACION> TerminoSimple() |
+    <VARIABLE> <INCREMENTO> |
+    <VARIABLE> <DECREMENTO>
+}
+
+void TerminoSimple() :
+{}
+{
+    ExpresionAritmetica()
+}
+
+void OperacionIncrementoDecremento() :
+{ Token t; Simbolo simbolo; boolean esIncremento; }
+{
+    (
+        t=<VARIABLE> <INCREMENTO> { esIncremento = true; }
+        |
+        t=<VARIABLE> <DECREMENTO> { esIncremento = false; }
+    )
+    {
+        // Verificar que la variable exista
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Variable no declarada '" + t.image + "'", t);
+        } else {
+            // Verificar que no sea constante
+            if (simbolo.esConstante) {
+                reportarErrorSemantico("No se puede modificar la constante '" + t.image + "'", t);
+            }
+            // Verificar que sea tipo numérico
+            else if (!simbolo.tipo.equals("entero") && !simbolo.tipo.equals("decimal")) {
+                reportarErrorSemantico("Operación '" + (esIncremento ? "++" : "--") + "' no permitida en tipo '" + simbolo.tipo + "'", t);
+            }
+            // Generar cuádrupla de incremento/decremento
+            else {
+                String operador = esIncremento ? "+" : "-";
+                String temporal = GeneradorCodigoIntermedio.generarTemporal();
+                GeneradorCodigoIntermedio.setTipoTemporal(temporal, simbolo.tipo);
+                // temporal = variable op 1
+                GeneradorCodigoIntermedio.agregarCuadrupla(operador, t.image, "1", temporal);
+                // variable = temporal
+                GeneradorCodigoIntermedio.agregarCuadrupla("=", temporal, "-", t.image);
+            }
+        }
+    }
+    <DELIMITADOR_LINEA>
+}
+
+// Regla para declaración de arreglos
+void DeclaracionArreglo() :
+{ Token t, tipoToken; String tipoDato, tipoArreglo; }
+{
+    // Tipo de elementos del arreglo
+    (
+        tipoToken=<TIPO_ENTERO> { tipoDato = "entero"; } |
+        tipoToken=<TIPO_DECIMAL> { tipoDato = "decimal"; } |
+        tipoToken=<TIPO_TEXTO> { tipoDato = "texto"; } |
+        tipoToken=<TIPO_CARACTER> { tipoDato = "caracter"; } |
+        tipoToken=<TIPO_BOOLEANO> { tipoDato = "booleano"; }
+    )
+    t=<VARIABLE> 
+    {
+        // Verificar si el arreglo ya existe
+        Simbolo simboloExistente = buscarSimbolo(t.image);
+        if (simboloExistente != null) {
+            reportarErrorSemantico("Declaración duplicada. El arreglo '" + t.image + "' ya existe", t);
+        } else {
+            // Registrar arreglo en tabla de símbolos
+            tipoArreglo = "arreglo_" + tipoDato;
+            agregarSimbolo(t.image, tipoArreglo, "arreglo", false);
+        }
+    }
+    <IGUAL_ASIGNACION> <ARREGLO> <CORCHETE_ABRE> ListaExpresiones() <CORCHETE_CIERRA> 
+    {
+        // Generar cuádrupla de creación de arreglo
+        GeneradorCodigoIntermedio.agregarCuadrupla("CREATE_ARRAY", tipoDato, "-", t.image);
+    }
+    <DELIMITADOR_LINEA>
+}
+
+// Regla para entrada sin parámetros (con verificación semántica)
+void EntradaSinParametros() :
+{ Token t; Simbolo simbolo; String temporal; }
+{
+    t=<VARIABLE>
+    {
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Variable no declarada '" + t.image + "'", t);
+        } else if (simbolo.esConstante) {
+            reportarErrorSemantico("Intento de reasignar valor a la constante '" + t.image + "'", t);
+        }
+    }
+    <IGUAL_ASIGNACION> <ENTRADA> <PARENTESIS_ABRE> <PARENTESIS_CIERRA>
+    {
+        // Generar cuádrupla de entrada solo si la variable es válida
+        if (simbolo != null && !simbolo.esConstante) {
+            temporal = GeneradorCodigoIntermedio.generarTemporal();
+            GeneradorCodigoIntermedio.setTipoTemporal(temporal, simbolo.tipo);
+            GeneradorCodigoIntermedio.agregarCuadrupla("INPUT", "-", "-", temporal);
+            GeneradorCodigoIntermedio.agregarCuadrupla("=", temporal, "-", t.image);
+        }
+    }
+    <DELIMITADOR_LINEA>
+}
+
+// Regla para la instrucción regresa
+void InstruccionRegresa() :
+{ String tipoExpresion; String temporalExpresion = null; }
+{
+    <REGRESA> 
+    [ 
+        temporalExpresion = Expresion() 
+        {
+            tipoExpresion = obtenerTipoExpresion(temporalExpresion);
+            // Generar cuádrupla de retorno con valor
+            GeneradorCodigoIntermedio.agregarCuadrupla("RETURN", temporalExpresion, "-", "-");
+        }
+    ]
+    {
+        // Si no hay expresión, es un return void
+        if (temporalExpresion == null) {
+            GeneradorCodigoIntermedio.agregarCuadrupla("RETURN", "-", "-", "-");
+        }
+    }
+    <DELIMITADOR_LINEA>
+}
+
+void Impresion() :
+{ Token opImp; String temporal; boolean conSalto; }
+{
+    ( opImp=<IMP> { conSalto = true; } | opImp=<IMPSL> { conSalto = false; } )
+    [ <PARENTESIS_ABRE> ]
+    temporal = Expresion()
+    {
+        // Generar cuádrupla para el primer argumento
+        String printOp = conSalto ? "PRINTLN" : "PRINT";
+        GeneradorCodigoIntermedio.agregarCuadrupla(printOp, temporal, "-", "-");
+    }
+    (
+        <COMA> temporal = Expresion()
+        {
+            // Generar cuádrupla para cada argumento adicional
+            GeneradorCodigoIntermedio.agregarCuadrupla(printOp, temporal, "-", "-");
+        }
+    )*
+    [ <PARENTESIS_CIERRA> ]
+    <DELIMITADOR_LINEA>
+}
+
+void Entrada() :
+{ Token t; Simbolo simbolo; String temporal; String tipoPrompt; }
+{
+    t=<VARIABLE>
+    {
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Variable no declarada '" + t.image + "'", t);
+        } else if (simbolo.esConstante) {
+            reportarErrorSemantico("Intento de reasignar valor a la constante '" + t.image + "'", t);
+        }
+    }
+    <IGUAL_ASIGNACION> <ENTRADA> <PARENTESIS_ABRE> tipoPrompt = Expresion() <PARENTESIS_CIERRA>
+    {
+        // Generar cuádrupla de entrada con prompt solo si la variable es válida
+        if (simbolo != null && !simbolo.esConstante) {
+            temporal = GeneradorCodigoIntermedio.generarTemporal();
+            GeneradorCodigoIntermedio.setTipoTemporal(temporal, simbolo.tipo);
+            // Primero imprimir el prompt (si no es vacío)
+            GeneradorCodigoIntermedio.agregarCuadrupla("PRINT", tipoPrompt, "-", "-");
+            // Luego leer la entrada y asignarla
+            GeneradorCodigoIntermedio.agregarCuadrupla("INPUT", "-", "-", temporal);
+            GeneradorCodigoIntermedio.agregarCuadrupla("=", temporal, "-", t.image);
+        }
+    }
+    <DELIMITADOR_LINEA>
+}
+
+void ListaExpresiones() :
+{}
+{
+    Expresion() ( <COMA> Expresion() )*
+}
+
+void CondicionalSi() :
+{ String temporalCondicion; String etiquetaElse, etiquetaFin = null; }
+{
+    try {
+        <SI> <PARENTESIS_ABRE> temporalCondicion = Expresion() <PARENTESIS_CIERRA> 
+        {
+            etiquetaElse = GeneradorCodigoIntermedio.generarEtiqueta();
+            GeneradorCodigoIntermedio.agregarCuadrupla("IF_FALSE", temporalCondicion, "-", etiquetaElse);
+        }
+        Bloque() 
+        [ 
+            <SI_NO> 
+            {
+                etiquetaFin = GeneradorCodigoIntermedio.generarEtiqueta();
+                GeneradorCodigoIntermedio.agregarCuadrupla("GOTO", "-", "-", etiquetaFin);
+                GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaElse);
+            }
+            Bloque() 
+            {
+                GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaFin);
+            }
+        ]
+        {
+            if (etiquetaFin == null) {
+                GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaElse);
+            }
+        }
+    } catch (ParseException e) {
+        erroresSintacticos++;
+        tabla.add(traducirMensaje(e.getMessage()));
+        saltar_hasta(LLAVE_CIERRA, FIN);
+    }
+}
+
+void CondicionalSegun() :
+{}
+{
+    try {
+        <SEGUN> <PARENTESIS_ABRE> Expresion() <PARENTESIS_CIERRA> <LLAVE_ABRE>
+        ( <CASO> Expresion() <DELIMITADOR_CASO> (Instruccion())* )*
+        [ <POR_DEFECTO> <DELIMITADOR_CASO> (Instruccion())* ]
+        <LLAVE_CIERRA>
+    } catch (ParseException e) {
+        erroresSintacticos++;
+        tabla.add(traducirMensaje(e.getMessage()));
+        saltar_hasta(LLAVE_CIERRA, FIN);
+    }
+}
+
+void CicloMientras() :
+{ String temporalCondicion; String etiquetaInicio, etiquetaFin; }
+{
+    try {
+        {
+            etiquetaInicio = GeneradorCodigoIntermedio.generarEtiqueta();
+            etiquetaFin = GeneradorCodigoIntermedio.generarEtiqueta();
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaInicio);
+        }
+        <MIENTRAS> <PARENTESIS_ABRE> temporalCondicion = Expresion() <PARENTESIS_CIERRA> 
+        {
+            GeneradorCodigoIntermedio.agregarCuadrupla("IF_FALSE", temporalCondicion, "-", etiquetaFin);
+        }
+        Bloque()
+        {
+            GeneradorCodigoIntermedio.agregarCuadrupla("GOTO", "-", "-", etiquetaInicio);
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaFin);
+        }
+    } catch (ParseException e) {
+        erroresSintacticos++;
+        tabla.add(traducirMensaje(e.getMessage()));
+        saltar_hasta(LLAVE_CIERRA, FIN);
+    }
+}
+
+
+void CicloHacerMientras() :
+{ String temporalCondicion; String etiquetaInicio; }
+{
+    try {
+        {
+            etiquetaInicio = GeneradorCodigoIntermedio.generarEtiqueta();
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaInicio);
+        }
+        <HACER> Bloque() <MIENTRAS> <PARENTESIS_ABRE> temporalCondicion = Expresion() <PARENTESIS_CIERRA>
+        {
+            GeneradorCodigoIntermedio.agregarCuadrupla("IF_TRUE", temporalCondicion, "-", etiquetaInicio);
+        }
+        <DELIMITADOR_LINEA>
+    } catch (ParseException e) {
+        erroresSintacticos++;
+        tabla.add(traducirMensaje(e.getMessage()));
+        saltar_hasta(DELIMITADOR_LINEA, LLAVE_CIERRA, FIN);
+    }
+}
+
+
+void CicloPara() :
+{ String temporalCondicion; String etiquetaInicio, etiquetaFin, etiquetaActualizacion; }
+{
+    try {
+        <PARA> <PARENTESIS_ABRE>
+        // Inicialización: declaración inline (sin su propio ';' al final)
+        DeclaracionPara()
+        <DELIMITADOR_LINEA>
+        {
+            // El LABEL de inicio debe generarse ANTES de evaluar la condición,
+            // para que el GOTO de fin del cuerpo regrese a re-evaluarla.
+            etiquetaInicio       = GeneradorCodigoIntermedio.generarEtiqueta();
+            etiquetaFin          = GeneradorCodigoIntermedio.generarEtiqueta();
+            etiquetaActualizacion = GeneradorCodigoIntermedio.generarEtiqueta();
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaInicio);
+        }
+        // Condición — se evalúa aquí, con el LABEL ya generado
+        temporalCondicion = Expresion()
+        {
+            GeneradorCodigoIntermedio.agregarCuadrupla("IF_FALSE", temporalCondicion, "-", etiquetaFin);
+        }
+        <DELIMITADOR_LINEA>
+        // Actualización: se parsea aquí pero sus cuádruplas se emiten DESPUÉS del cuerpo.
+        // Para ello redirigimos temporalmente la lista de cuádruplas.
+        {
+            // Guardar cuádruplas actuales
+            ArrayList<Cuadrupla> cuadrupasAntes = new ArrayList<Cuadrupla>(GeneradorCodigoIntermedio.cuadruplas);
+            GeneradorCodigoIntermedio.cuadruplas.clear();
+        }
+        IncrementoDecrementoPara()
+        {
+            // Capturar las cuádruplas de actualización y restaurar las anteriores
+            ArrayList<Cuadrupla> cuadruplasActualizacion = new ArrayList<Cuadrupla>(GeneradorCodigoIntermedio.cuadruplas);
+            GeneradorCodigoIntermedio.cuadruplas = cuadrupasAntes;
+        }
+        <PARENTESIS_CIERRA>
+        // Cuerpo del ciclo
+        Bloque()
+        {
+            // Emitir la actualización DESPUÉS del cuerpo, luego saltar al inicio
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaActualizacion);
+            for (Cuadrupla cAct : cuadruplasActualizacion) {
+                GeneradorCodigoIntermedio.agregarCuadrupla(cAct.operador, cAct.operando1, cAct.operando2, cAct.resultado);
+            }
+            GeneradorCodigoIntermedio.agregarCuadrupla("GOTO", "-", "-", etiquetaInicio);
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaFin);
+        }
+    } catch (ParseException e) {
+        erroresSintacticos++;
+        tabla.add(traducirMensaje(e.getMessage()));
+        saltar_hasta(LLAVE_CIERRA, FIN);
+    }
+}
+
+// Declaración inline para el 'para': igual que Declaracion() pero SIN consumir ';'
+void DeclaracionPara() :
+{ Token t, tipoToken; String tipoDato, tipoExpresion, temporalExpresion; boolean esConstante = false; Simbolo simbolo; }
+{
+    (
+        tipoToken=<TIPO_ENTERO>   { tipoDato = "entero"; }   |
+        tipoToken=<TIPO_DECIMAL>  { tipoDato = "decimal"; }  |
+        tipoToken=<TIPO_TEXTO>    { tipoDato = "texto"; }    |
+        tipoToken=<TIPO_CARACTER> { tipoDato = "caracter"; } |
+        tipoToken=<TIPO_BOOLEANO> { tipoDato = "booleano"; }
+    )
+    (t=<VARIABLE> | t=<CONSTANTE>)
+    {
+        esConstante = t.kind == CONSTANTE;
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo != null) {
+            reportarErrorSemantico("Declaración duplicada. La variable '" + t.image + "' ya existe", t);
+        }
+    }
+    <IGUAL_ASIGNACION>
+    temporalExpresion = Expresion()
+    {
+        tipoExpresion = obtenerTipoExpresion(temporalExpresion);
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            String categoria = esConstante ? "constante" : "variable";
+            agregarSimbolo(t.image, tipoDato, categoria, esConstante);
+            if (!compatibles(tipoDato, tipoExpresion)) {
+                reportarErrorSemantico("Tipos incompatibles. Variable '" + t.image +
+                    "' declarada como " + tipoDato + " pero se asigna " + tipoExpresion, t);
+            } else {
+                GeneradorCodigoIntermedio.agregarCuadrupla("=", temporalExpresion, "-", t.image);
+            }
+        }
+    }
+    // Sin <DELIMITADOR_LINEA>: lo consume el CicloPara
+}
+
+// Incremento/decremento inline para el 'para': igual que OperacionIncrementoDecremento() pero SIN consumir ';'
+void IncrementoDecrementoPara() :
+{ Token t; Simbolo simbolo; boolean esIncremento; }
+{
+    (
+        t=<VARIABLE> <INCREMENTO> { esIncremento = true;  }
+        |
+        t=<VARIABLE> <DECREMENTO> { esIncremento = false; }
+    )
+    {
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Variable no declarada '" + t.image + "'", t);
+        } else if (simbolo.esConstante) {
+            reportarErrorSemantico("No se puede modificar la constante '" + t.image + "'", t);
+        } else if (!simbolo.tipo.equals("entero") && !simbolo.tipo.equals("decimal")) {
+            reportarErrorSemantico("Operación '" + (esIncremento ? "++" : "--") +
+                "' no permitida en tipo '" + simbolo.tipo + "'", t);
+        } else {
+            GeneradorCodigoIntermedio.agregarCuadrupla(esIncremento ? "INC" : "DEC", t.image, "-", "-");
+        }
+    }
+    // Sin <DELIMITADOR_LINEA>: lo consume el CicloPara
+}
+
+void Funcion() :
+{ Token t, tipoToken; String nombreFuncion, tipoRetorno; String etiquetaInicio; String etiquetaFin; }
+{
+    try {
+        <FUNCION> 
+        // Tipo de retorno (opcional, por defecto void)
+        (
+            tipoToken=<TIPO_ENTERO> { tipoRetorno = "entero"; } |
+            tipoToken=<TIPO_DECIMAL> { tipoRetorno = "decimal"; } |
+            tipoToken=<TIPO_TEXTO> { tipoRetorno = "texto"; } |
+            tipoToken=<TIPO_CARACTER> { tipoRetorno = "caracter"; } |
+            tipoToken=<TIPO_BOOLEANO> { tipoRetorno = "booleano"; } |
+            /* void por defecto */ { tipoRetorno = "void"; }
+        )
+        t=<VARIABLE> 
+        {
+            nombreFuncion = t.image;
+            // Verificar si la función ya existe
+            Simbolo simboloExistente = buscarSimbolo(nombreFuncion);
+            if (simboloExistente != null) {
+                reportarErrorSemantico("Función '" + nombreFuncion + "' ya declarada", t);
+            } else {
+                // Registrar función en tabla de símbolos con tipo de retorno
+                agregarSimbolo(nombreFuncion, tipoRetorno, "funcion", false);
+            }
+            // Generar etiquetas para la función
+            etiquetaInicio = "FUNC_" + nombreFuncion;
+            etiquetaFin = "END_FUNC_" + nombreFuncion;
+            // Generar cuádrupla de inicio de función
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaInicio);
+            GeneradorCodigoIntermedio.agregarCuadrupla("BEGIN_FUNC", nombreFuncion, tipoRetorno, "-");
+        }
+        <PARENTESIS_ABRE>
+        // Abrimos UN solo scope que abarca parámetros + cuerpo de la función
+        { 
+            entrarScope();
+            // Apuntar al símbolo de esta función para que ParametrosTipados()
+            // pueda registrar los tipos de parámetros en él
+            ultimaFuncionDeclarada = nombreFuncion;
+        }
+        [ ParametrosTipados() ]
+        <PARENTESIS_CIERRA>
+        { ultimaFuncionDeclarada = null; } // Ya no estamos declarando parámetros
+        // BloqueConScope no crea scope propio; reutiliza el scope ya abierto
+        BloqueConScope()
+        {
+            // Generar cuádrupla de fin de función (por si no hay return explícito)
+            GeneradorCodigoIntermedio.agregarCuadrupla("END_FUNC", nombreFuncion, tipoRetorno, "-");
+            GeneradorCodigoIntermedio.agregarCuadrupla("LABEL", "-", "-", etiquetaFin);
+            salirScope();
+        }
+    } catch (ParseException e) {
+        erroresSintacticos++;
+        tabla.add(traducirMensaje(e.getMessage()));
+        saltar_hasta(LLAVE_CIERRA, FIN);
+    }
+}
+
+// Bloque sin scope propio: para usarse cuando el scope ya fue abierto externamente (ej: funciones)
+void BloqueConScope() :
+{}
+{
+    <LLAVE_ABRE>
+    (Instruccion())*
+    <LLAVE_CIERRA>
+}
+
+void ParametrosTipados() :
+{ Token t, tipoToken; String tipoParam; }
+{
+    // Primer parámetro con tipo
+    (
+        tipoToken=<TIPO_ENTERO>   { tipoParam = "entero"; }   |
+        tipoToken=<TIPO_DECIMAL>  { tipoParam = "decimal"; }  |
+        tipoToken=<TIPO_TEXTO>    { tipoParam = "texto"; }    |
+        tipoToken=<TIPO_CARACTER> { tipoParam = "caracter"; } |
+        tipoToken=<TIPO_BOOLEANO> { tipoParam = "booleano"; }
+    )
+    t=<VARIABLE> 
+    {
+        // Registrar parámetro en tabla de símbolos con tipo explícito
+        if (!existeSimboloEnScopeActual(t.image)) {
+            agregarSimbolo(t.image, tipoParam, "parametro", false);
+        }
+        // Registrar el tipo de este parámetro en el símbolo de la función (scope padre)
+        registrarTipoParametroFuncion(tipoParam);
+    }
+    ( <COMA> 
+        // Parámetros adicionales con tipo
+        (
+            tipoToken=<TIPO_ENTERO>   { tipoParam = "entero"; }   |
+            tipoToken=<TIPO_DECIMAL>  { tipoParam = "decimal"; }  |
+            tipoToken=<TIPO_TEXTO>    { tipoParam = "texto"; }    |
+            tipoToken=<TIPO_CARACTER> { tipoParam = "caracter"; } |
+            tipoToken=<TIPO_BOOLEANO> { tipoParam = "booleano"; }
+        )
+        t=<VARIABLE> 
+        {
+            if (!existeSimboloEnScopeActual(t.image)) {
+                agregarSimbolo(t.image, tipoParam, "parametro", false);
+            }
+            registrarTipoParametroFuncion(tipoParam);
+        }
+    )*
+}
+
+String LlamadaFuncion() :
+{ Token t; Simbolo simbolo; String temporal; String tipoArg; int contadorParametros = 2; }
+{
+    // ── pot2(base) ── eleva al cuadrado, requiere 1 argumento numérico, devuelve decimal
+    ( t=<POT2>
+    {
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "decimal");
+    }
+    <PARENTESIS_ABRE>
+    tipoArg = Expresion()
+    {
+        String tipoArgPot2 = obtenerTipoExpresion(tipoArg);
+        if (!tipoArgPot2.equals("entero") && !tipoArgPot2.equals("decimal")) {
+            reportarErrorSemantico("Función 'pot2' requiere argumento numérico, se recibió '" + tipoArgPot2 + "'", t);
+            return "error";
+        }
+        GeneradorCodigoIntermedio.agregarCuadrupla("POT2", tipoArg, "-", temporal);
+    }
+    <PARENTESIS_CIERRA>
+    { return temporal; }
+
+    // ── pot(base, exponente) ── requiere 2 argumentos numéricos, devuelve decimal
+|   t=<POT>
+    {
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "decimal");
+    }
+    <PARENTESIS_ABRE>
+    tipoArg = Expresion()
+    {
+        String tipoBase = obtenerTipoExpresion(tipoArg);
+        if (!tipoBase.equals("entero") && !tipoBase.equals("decimal")) {
+            reportarErrorSemantico("Función 'pot': argumento 'base' debe ser numérico, se recibió '" + tipoBase + "'", t);
+            return "error";
+        }
+    }
+    <COMA>
+    tipoArg = Expresion()
+    {
+        String tipoExp = obtenerTipoExpresion(tipoArg);
+        if (!tipoExp.equals("entero") && !tipoExp.equals("decimal")) {
+            reportarErrorSemantico("Función 'pot': argumento 'exponente' debe ser numérico, se recibió '" + tipoExp + "'", t);
+            return "error";
+        }
+        GeneradorCodigoIntermedio.agregarCuadrupla("POT", tipoArg, "-", temporal);
+    }
+    <PARENTESIS_CIERRA>
+    { return temporal; }
+
+    // ── raiz2(n) ── raíz cuadrada, requiere 1 argumento numérico, devuelve decimal
+|   t=<RAIZ2>
+    {
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "decimal");
+    }
+    <PARENTESIS_ABRE>
+    tipoArg = Expresion()
+    {
+        String tipoArgRaiz2 = obtenerTipoExpresion(tipoArg);
+        if (!tipoArgRaiz2.equals("entero") && !tipoArgRaiz2.equals("decimal")) {
+            reportarErrorSemantico("Función 'raiz2' requiere argumento numérico, se recibió '" + tipoArgRaiz2 + "'", t);
+            return "error";
+        }
+        GeneradorCodigoIntermedio.agregarCuadrupla("RAIZ2", tipoArg, "-", temporal);
+    }
+    <PARENTESIS_CIERRA>
+    { return temporal; }
+
+    // ── raiz(n, indice) ── raíz n-ésima, requiere 2 argumentos numéricos, devuelve decimal
+|   t=<RAIZ>
+    {
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "decimal");
+    }
+    <PARENTESIS_ABRE>
+    tipoArg = Expresion()
+    {
+        String tipoRadicando = obtenerTipoExpresion(tipoArg);
+        if (!tipoRadicando.equals("entero") && !tipoRadicando.equals("decimal")) {
+            reportarErrorSemantico("Función 'raiz': argumento 'radicando' debe ser numérico, se recibió '" + tipoRadicando + "'", t);
+            return "error";
+        }
+    }
+    <COMA>
+    tipoArg = Expresion()
+    {
+        String tipoIndice = obtenerTipoExpresion(tipoArg);
+        if (!tipoIndice.equals("entero") && !tipoIndice.equals("decimal")) {
+            reportarErrorSemantico("Función 'raiz': argumento 'índice' debe ser numérico, se recibió '" + tipoIndice + "'", t);
+            return "error";
+        }
+        GeneradorCodigoIntermedio.agregarCuadrupla("RAIZ", tipoArg, "-", temporal);
+    }
+    <PARENTESIS_CIERRA>
+    { return temporal; }
+
+    // ── imp / impsl ── no retornan valor
+|   t=<IMP>
+    {
+        GeneradorCodigoIntermedio.agregarCuadrupla("PRINT", "-", "-", "-");
+        return "void";
+    }
+|   t=<IMPSL>
+    {
+        GeneradorCodigoIntermedio.agregarCuadrupla("PRINTLN", "-", "-", "-");
+        return "void";
+    }
+
+    // ── entrada() ── retorna texto
+|   t=<ENTRADA>
+    {
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "texto");
+        GeneradorCodigoIntermedio.agregarCuadrupla("INPUT", "-", "-", temporal);
+        return temporal;
+    }
+
+    // ── longitud(arreglo/texto) ── retorna entero
+|   t=<LONGITUD>
+    {
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "entero");
+    }
+    <PARENTESIS_ABRE>
+    tipoArg = Expresion()
+    <PARENTESIS_CIERRA>
+    {
+        GeneradorCodigoIntermedio.agregarCuadrupla("LENGTH", tipoArg, "-", temporal);
+        return temporal;
+    }
+
+    // ── llamada a función de usuario ──
+|   t=<VARIABLE> )
+    {
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Función no declarada '" + t.image + "'", t);
+            return "error";
+        }
+        if (!simbolo.categoria.equals("funcion")) {
+            reportarErrorSemantico("'" + t.image + "' no es una función", t);
+            return "error";
+        }
+        GeneradorCodigoIntermedio.agregarCuadrupla("ERA", t.image, "-", "-");
+    }
+    <PARENTESIS_ABRE>
+    {
+        // Recolectamos tipos de argumentos para verificar contra la firma declarada
+        ArrayList<String> tiposArgs = new ArrayList<String>();
+        boolean hayErrorArgs = false;
+    }
+    [
+        tipoArg = Expresion()
+        {
+            String tArg1 = obtenerTipoExpresion(tipoArg);
+            tiposArgs.add(tArg1);
+            if (tArg1.equals("error")) hayErrorArgs = true;
+            else GeneradorCodigoIntermedio.agregarCuadrupla("PARAM", tipoArg, "-", "param1");
+        }
+        ( <COMA> tipoArg = Expresion()
+            {
+                String tArgN = obtenerTipoExpresion(tipoArg);
+                tiposArgs.add(tArgN);
+                if (tArgN.equals("error")) hayErrorArgs = true;
+                else GeneradorCodigoIntermedio.agregarCuadrupla("PARAM", tipoArg, "-", "param" + (contadorParametros++));
+            }
+        )*
+    ]
+    <PARENTESIS_CIERRA>
+    {
+        // ── Verificar cantidad de parámetros ──
+        int esperados = simbolo.tiposParametros.size();
+        int recibidos = tiposArgs.size();
+        if (esperados != recibidos) {
+            reportarErrorSemantico(
+                "Función '" + t.image + "' espera " + esperados +
+                " parámetro(s) pero se proporcionaron " + recibidos, t);
+            return "error";
+        }
+
+        // ── Verificar tipos de parámetros uno a uno ──
+        if (!hayErrorArgs) {
+            for (int i = 0; i < esperados; i++) {
+                String tipoEsperado = simbolo.tiposParametros.get(i);
+                String tipoRecibido = tiposArgs.get(i);
+                if (!compatibles(tipoEsperado, tipoRecibido)) {
+                    reportarErrorSemantico(
+                        "Función '" + t.image + "': parámetro " + (i + 1) +
+                        " esperaba '" + tipoEsperado + "' pero se recibió '" + tipoRecibido + "'", t);
+                    return "error";
+                }
+            }
+        }
+
+        // ── Sin errores: generar CALL y registrar tipo del resultado ──
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, simbolo.tipo);
+        GeneradorCodigoIntermedio.agregarCuadrupla("CALL", t.image, "-", temporal);
+        return temporal;
+    }
+}
+
+void LlamadaFuncionStmt() :
+{}
+{
+    LlamadaFuncion() 
+    <DELIMITADOR_LINEA>
+}
+
+void Bloque() :
+{}
+{
+    <LLAVE_ABRE> 
+    { entrarScope(); }
+    (Instruccion())* 
+    <LLAVE_CIERRA>
+    { salirScope(); }
+}
+
+String Expresion() :
+{ String tipo; }
+{
+    tipo = ExpresionLogica()
+    { return tipo; }
+}
+
+String ExpresionLogica() :
+{ String tipo1, tipo2, resultado, temporal1, temporal2, tempResultado; Token op; }
+{
+    temporal1 = ExpresionComparacion()
+    {
+        tipo1 = obtenerTipoExpresion(temporal1);
+    }
+    (
+        ( op=<Y_LOGICO> | op=<O_LOGICO> ) temporal2 = ExpresionComparacion()
+        {
+            tipo2 = obtenerTipoExpresion(temporal2);
+            // No generar código si algún operando tiene error semántico
+            if (temporal1.equals("error") || temporal2.equals("error")) {
+                temporal1 = "error";
+                tipo1 = "error";
+            } else {
+                resultado = verificarTipoLogico(tipo1, tipo2, op.image, op);
+                if (!resultado.equals("error")) {
+                    tempResultado = GeneradorCodigoIntermedio.generarTemporal();
+                    GeneradorCodigoIntermedio.setTipoTemporal(tempResultado, resultado);
+                    String operadorCod = op.image.equals("&&") ? "AND" : "OR";
+                    GeneradorCodigoIntermedio.agregarCuadrupla(operadorCod, temporal1, temporal2, tempResultado);
+                    GeneradorCodigoIntermedio.agregarTemporal(temporal1);
+                    temporal1 = tempResultado;
+                    tipo1 = resultado;
+                } else {
+                    temporal1 = "error";
+                    tipo1 = "error";
+                }
+            }
+        }
+    )*
+    { return temporal1; }
+}
+
+String ExpresionComparacion() :
+{ String tipo1, tipo2, resultado, temporal1, temporal2, tempResultado; Token op; }
+{
+    temporal1 = ExpresionAritmetica()
+    {
+        tipo1 = obtenerTipoExpresion(temporal1);
+    }
+    (
+        ( op=<IGUAL_COMPARACION> | op=<DIFERENTE> | op=<MENOR> | op=<MAYOR> | op=<MENOR_IGUAL> | op=<MAYOR_IGUAL> ) 
+        temporal2 = ExpresionAritmetica()
+        {
+            tipo2 = obtenerTipoExpresion(temporal2);
+            // No generar código si algún operando tiene error semántico
+            if (temporal1.equals("error") || temporal2.equals("error")) {
+                temporal1 = "error";
+                tipo1 = "error";
+            } else {
+                resultado = verificarTipoComparacion(tipo1, tipo2, op.image, op);
+                if (!resultado.equals("error")) {
+                    tempResultado = GeneradorCodigoIntermedio.generarTemporal();
+                    GeneradorCodigoIntermedio.setTipoTemporal(tempResultado, resultado);
+                    String operadorCod = "";
+                    switch(op.image) {
+                        case "==": operadorCod = "EQ"; break;
+                        case "!=": operadorCod = "NE"; break;
+                        case "<":  operadorCod = "LT"; break;
+                        case ">":  operadorCod = "GT"; break;
+                        case "<=": operadorCod = "LE"; break;
+                        case ">=": operadorCod = "GE"; break;
+                    }
+                    GeneradorCodigoIntermedio.agregarCuadrupla(operadorCod, temporal1, temporal2, tempResultado);
+                    GeneradorCodigoIntermedio.agregarTemporal(temporal1);
+                    temporal1 = tempResultado;
+                    tipo1 = resultado;
+                } else {
+                    temporal1 = "error";
+                    tipo1 = "error";
+                }
+            }
+        }
+    )?
+    { return temporal1; }
+}
+
+String ExpresionAritmetica() :
+{ String tipo1, tipo2, resultado, temporal1, temporal2, tempResultado; Token op; }
+{
+    temporal1 = Termino()
+    {
+        tipo1 = obtenerTipoExpresion(temporal1);
+    }
+    (
+        ( op=<SUMA> | op=<RESTA> ) temporal2 = Termino()
+        {
+            tipo2 = obtenerTipoExpresion(temporal2);
+            // No generar código si algún operando tiene error semántico
+            if (temporal1.equals("error") || temporal2.equals("error")) {
+                temporal1 = "error";
+                tipo1 = "error";
+            } else {
+                resultado = verificarTipoAritmetico(tipo1, tipo2, op.image, op);
+                if (!resultado.equals("error")) {
+                    tempResultado = GeneradorCodigoIntermedio.generarTemporal();
+                    GeneradorCodigoIntermedio.setTipoTemporal(tempResultado, resultado);
+                    GeneradorCodigoIntermedio.agregarCuadrupla(op.image.equals("+") ? "SUMA" : "RESTA",
+                        temporal1, temporal2, tempResultado);
+                    GeneradorCodigoIntermedio.agregarTemporal(temporal1);
+                    temporal1 = tempResultado;
+                    tipo1 = resultado;
+                } else {
+                    temporal1 = "error";
+                    tipo1 = "error";
+                }
+            }
+        }
+    )*
+    { return temporal1; }
+}
+
+String Termino() :
+{ String tipo1, tipo2, resultado, temporal1, temporal2, tempResultado; Token op; }
+{
+    temporal1 = Factor()
+    {
+        tipo1 = obtenerTipoExpresion(temporal1);
+    }
+    (
+        ( op=<MULTIPLICACION> | op=<DIVISION_DECIMAL> | op=<DIVISION_ENTERA> | op=<MODULO> ) 
+        temporal2 = Factor()
+        {
+            tipo2 = obtenerTipoExpresion(temporal2);
+            // No generar código si algún operando tiene error semántico
+            if (temporal1.equals("error") || temporal2.equals("error")) {
+                temporal1 = "error";
+                tipo1 = "error";
+            } else {
+                resultado = verificarTipoAritmetico(tipo1, tipo2, op.image, op);
+                if (!resultado.equals("error")) {
+                    tempResultado = GeneradorCodigoIntermedio.generarTemporal();
+                    GeneradorCodigoIntermedio.setTipoTemporal(tempResultado, resultado);
+                    String operadorCod = "";
+                    if (op.image.equals("*"))  operadorCod = "MULT";
+                    else if (op.image.equals("/"))  operadorCod = "DIV";
+                    else if (op.image.equals("//")) operadorCod = "DIV_ENT";
+                    else if (op.image.equals("%"))  operadorCod = "MOD";
+                    GeneradorCodigoIntermedio.agregarCuadrupla(operadorCod, temporal1, temporal2, tempResultado);
+                    GeneradorCodigoIntermedio.agregarTemporal(temporal1);
+                    temporal1 = tempResultado;
+                    tipo1 = resultado;
+                } else {
+                    temporal1 = "error";
+                    tipo1 = "error";
+                }
+            }
+        }
+    )*
+    { return temporal1; }
+}
+
+String Factor() :
+{ Token t; Simbolo simbolo; String tipo, temporal, temporalIndice = null; }
+{
+    ( t=<RESTA> ) temporal = Factor()
+    { 
+        tipo = obtenerTipoExpresion(temporal);
+        // La negación unaria solo aplica a tipos numéricos
+        if (!tipo.equals("entero") && !tipo.equals("decimal")) {
+            reportarErrorSemantico("Negación unaria inválida. Tipo '" + tipo + "' no es numérico", t);
+            return "error";
+        }
+        String tempResultado = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(tempResultado, tipo); // Establecer tipo del temporal
+        GeneradorCodigoIntermedio.agregarCuadrupla("NEG", temporal, "-", tempResultado);
+        return tempResultado; 
+    }
+|   t=<ENTERO> 
+    { 
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "entero"); // Establecer tipo del temporal
+        GeneradorCodigoIntermedio.agregarCuadrupla("=", t.image, "-", temporal);
+        return temporal; 
+    }
+|   t=<DECIMAL> 
+    { 
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "decimal"); // Establecer tipo del temporal
+        GeneradorCodigoIntermedio.agregarCuadrupla("=", t.image, "-", temporal);
+        return temporal; 
+    }
+|   t=<BOOLEANO> 
+    { 
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "booleano"); // Establecer tipo del temporal
+        GeneradorCodigoIntermedio.agregarCuadrupla("=", t.image, "-", temporal);
+        return temporal; 
+    }
+|   t=<CARACTER> 
+    { 
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "caracter"); // Establecer tipo del temporal
+        GeneradorCodigoIntermedio.agregarCuadrupla("=", t.image, "-", temporal);
+        return temporal; 
+    }
+|   t=<TEXTO> 
+    { 
+        temporal = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(temporal, "texto"); // Establecer tipo del temporal
+        GeneradorCodigoIntermedio.agregarCuadrupla("=", t.image, "-", temporal);
+        return temporal; 
+    }
+|   tipo = LlamadaFuncion() { return tipo; }
+|   t=<VARIABLE> ( "[" temporalIndice = Expresion() "]" 
+    {
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo != null) {
+            String tipoElem = simbolo.tipo.replace("arreglo_", "");
+            String tAcc = GeneradorCodigoIntermedio.generarTemporal();
+            GeneradorCodigoIntermedio.setTipoTemporal(tAcc, tipoElem);
+            GeneradorCodigoIntermedio.agregarCuadrupla("ACCESS", t.image, temporalIndice, tAcc);
+            return tAcc;
+        }
+    }
+    )? 
+    { 
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Variable no declarada '" + t.image + "'", t);
+            return "error";
+        }
+        return t.image; 
+    }
+|   t=<CONSTANTE> ("[" Expresion() "]")? 
+    { 
+        simbolo = buscarSimbolo(t.image);
+        if (simbolo == null) {
+            reportarErrorSemantico("Constante no declarada '" + t.image + "'", t);
+            return "error";
+        }
+        // Para generación de código intermedio, devolvemos el nombre de la constante
+        return t.image; 
+    }
+|   <ARREGLO> <CORCHETE_ABRE> [ ListaExpresiones() ] <CORCHETE_CIERRA> { return "arreglo"; }  
+|   <ENTRADA> <PARENTESIS_ABRE> [ ListaExpresiones() ] <PARENTESIS_CIERRA> { return "texto"; }
+|   t=<NO_LOGICO> temporal = Factor()
+    { 
+        tipo = obtenerTipoExpresion(temporal);
+        // La negación lógica solo aplica a booleanos
+        if (!tipo.equals("booleano")) {
+            reportarErrorSemantico("Negación lógica inválida. Tipo '" + tipo + "' no es booleano", t);
+            return "error";
+        }
+        String tempResultado = GeneradorCodigoIntermedio.generarTemporal();
+        GeneradorCodigoIntermedio.setTipoTemporal(tempResultado, "booleano"); // Establecer tipo del temporal
+        GeneradorCodigoIntermedio.agregarCuadrupla("NOT", temporal, "-", tempResultado);
+        return tempResultado; 
+    }
+|   <PARENTESIS_ABRE> temporal = Expresion() <PARENTESIS_CIERRA> { return temporal; }
+}

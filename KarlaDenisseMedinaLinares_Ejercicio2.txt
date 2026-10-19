@@ -1,0 +1,21 @@
+inicio
+    entero a = 0;
+    entero b = 1;
+    entero c = 0;
+    entero i = 1;
+    entero n = 0;
+    entero resultado = 0;
+    impsl("Cuántos números quieres generar ");
+    n = leer("Ingresa un número: ");
+    mientras (i <= n) {
+        resultado = a + b - (2 * i);
+        imp(i);
+        imp(", ");
+        impsl(resultado);
+
+        c = a + b;
+        a = b;
+        b = c;
+        i = i + 1;
+    }
+fin

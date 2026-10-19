@@ -1,0 +1,24 @@
+inicio
+    entero a = 0;
+    entero b = 1;
+    entero c = 0;
+    entero i = 0;
+    entero suma = 0;
+    entero n = 0;
+
+    imp("Cuantos numeros de Fibonacci quieres sumar: ");
+    n = leer("N: ");
+
+    mientras (i < n) {
+        suma = suma + a;
+        c = a + b;
+        a = b;
+        b = c;
+        i = i + 1;
+    }
+
+    imp("La suma de los primeros ");
+    imp(n);
+    imp(" numeros de Fibonacci es: ");
+    impsl(suma);
+fin
